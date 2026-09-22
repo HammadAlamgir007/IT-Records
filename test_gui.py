@@ -9,6 +9,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication
 
 import main as gui
@@ -90,8 +91,13 @@ def check_window(store, username, role, password):
 
     expect(window.table.rowCount() == len(store.employees()),
            f"{role}: the table shows every employee")
-    expect(window.table.columnCount() == len(gui.COLUMNS) + 3,
-           f"{role}: Sno, every field, updated, updated by")
+    expect(window.table.columnCount() == len(gui.COLUMNS) + 2,
+           f"{role}: every field (Sno is one of them), updated, updated by")
+    expect(window.table.horizontalHeaderItem(0).text() == gui.LABELS["sno"],
+           f"{role}: the serial number is the first column on the employee page")
+    expect(all(window.table.item(r, 0).text().strip()
+               for r in range(window.table.rowCount())),
+           f"{role}: and every row actually shows one")
 
     window.search.setText("Bilal")
     QApplication.processEvents()
@@ -307,10 +313,49 @@ def check_duplicate_assets(store):
         "an employee must not grab an asset that is issued to someone else")
 
 
+def check_sorted_selection(store, app):
+    """Clicking a column header reorders the table. What Edit, Delete and Print
+    Record act on must still be the row the user is looking at, not whichever
+    record happens to sit at that position in the unsorted list."""
+    # Names picked so sorting really does move rows: the register loads newest
+    # first, so alphabetical order is not the order they went in.
+    for emp_id, name in (("E-7001", "Zoya Malik"), ("E-7002", "Adnan Butt"),
+                         ("E-7003", "Mehwish Raza")):
+        store.add_employee({"emp_id": emp_id, "emp_name": name}, "superadmin", "superadmin")
+
+    window = gui.MainWindow(store, "superadmin", "superadmin")
+    window.show()
+    QApplication.processEvents()
+
+    table = window.table
+    name_column = gui.COLUMNS.index("emp_name")
+    table.sortItems(name_column, Qt.DescendingOrder)   # the opposite of the load order
+    QApplication.processEvents()
+
+    on_screen_order = [table.item(r, name_column).text() for r in range(table.rowCount())]
+    expect(on_screen_order != [r["emp_name"] for r in window.rows],
+           "the sort really did move the rows - otherwise this check proves nothing")
+
+    for view_row in range(table.rowCount()):
+        table.selectRow(view_row)
+        QApplication.processEvents()
+        on_screen = table.item(view_row, name_column).text()
+        expect(window.selected()["emp_name"] == on_screen,
+               f"row {view_row} of a sorted table hands back the record it shows")
+
+    table.selectAll()
+    QApplication.processEvents()
+    expect(sorted(r["emp_name"] for r in window.selected_records())
+           == sorted(r["emp_name"] for r in store.employees()),
+           "selecting everything hands back every record exactly once")
+    window.close()
+
+
 def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(gui.STYLE)
     with tempfile.TemporaryDirectory() as tmp:
+      try:
         folder = Path(tmp)
         store = Store(folder / "gui.db")
         _, password = store.bootstrap()
@@ -326,9 +371,13 @@ def main():
         check_form(window)
         check_import_preview(window, folder)
         check_window(store, "amir", "user", "viewer-password")
+        check_sorted_selection(store, app)
         check_assets(store, app)
         check_exports(store, folder)
         check_duplicate_assets(store)
+      finally:
+        import logging
+        logging.shutdown()
     print("gui check OK")
 
 

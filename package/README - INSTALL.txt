@@ -1,6 +1,6 @@
 IT Records - installation
 
-The app now reads the real data by itself, so both ways below work:
+The app reads the real data by itself, so both ways below work:
 
 Fastest:  double-click  IT Records.exe
           - on a PC with no IT Records data yet, it automatically picks up the
@@ -20,7 +20,12 @@ copy arrived):
      IT Records.exe again.
 
 Sign-in
-The app opens read-only. Admin buttons ask for a sign-in; the super admin login
-is:
-    superadmin   /   YYcqiwYtUy7G
-Change your password from the My Account tab.
+The app opens read-only - anyone can look at everything. The admin buttons
+(Add, Edit, Delete, Import, Export, Print Record, Assign) ask for a sign-in:
+
+    superadmin   /   admin
+
+That login is fixed in the program and is re-applied every time the app opens,
+so it cannot be lost. Changing it from the My Account tab will not stick - to
+change it for good it has to be changed in the source and the exe rebuilt.
+Ordinary accounts created under the Users tab are unaffected.

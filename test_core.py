@@ -128,6 +128,8 @@ def test_assets(store):
            "assigning fills the employee's matching field")
     expect(store.employees("E-1001")[0]["laptop_name_type"] == "ThinkPad",
            "and the model lands too")
+    expect(store.asset(laptop)["status"] == "In use",
+           "an item somebody holds reads 'In use', not the 'Spare' it was added as")
 
     # transfer -> the old holder is written off and the new one opens
     store.assign_asset(laptop, "E-1002", note="handover", actor="superadmin", role="superadmin")
@@ -155,6 +157,8 @@ def test_assets(store):
     latest = store.asset(laptop)
     expect(latest["current_emp_id"] == "" and latest["current_emp_name"] == "",
            "released removes the current holder")
+    expect(latest["status"] == "Spare",
+           "and puts it back in stock, so no row says 'In use' with nobody holding it")
     expect(store.asset_history(latest)[0]["released_on"], "the release is time-stamped")
     expect(store.employee_assets("E-1002") and
            store.employee_assets("E-1002")[0]["asset_identity"] == "TP-X2",
@@ -454,7 +458,13 @@ def test_source_files(folder):
 
     import build_import_file as bif
 
-    clean, review, needs_id, stats = bif.records_for_import()
+    try:
+        clean, review, needs_id, stats = bif.records_for_import()
+    except ModuleNotFoundError as exc:
+        # mobile.xls is the old binary Excel format, which needs xlrd. It is a
+        # build-time helper, not something the app itself ever reads.
+        print(f"  (skipping source-file check: {exc})")
+        return
     expect(stats["clean"] > 0 and stats["matched"] > 0,
            "the three files yield rows and challan matches")
     expect(stats["printers"] > 0 and stats["ip"] > 0 and stats["stock"] > 0,
@@ -605,6 +615,32 @@ def test_record_pdf(store, folder):
     empty = export_record_pdf("ASSET RECORD", [], company=company, path=folder / "empty.pdf")
     expect(empty.stat().st_size > 0, "a record with no details still prints")
 
+    check_pdf_type_size(pdf, "the record document")
+    check_pdf_type_size(export_pdf(store.employees(), folder / "table.pdf"), "the register table")
+
+
+def check_pdf_type_size(path, what):
+    """Setting a page size on a QTextDocument makes Qt scale the finished layout
+    onto the paper: every point size comes out far bigger than the stylesheet
+    asked for and the right-hand side runs off the page. Read the type back out
+    of the file and make sure it is the size that was asked for."""
+    try:
+        import pymupdf
+    except ImportError:
+        print("  (skipping PDF type-size check: pymupdf is not installed)")
+        return
+    with pymupdf.open(path) as doc:
+        page = doc[0]
+        spans = [s for b in page.get_text("dict")["blocks"]
+                 for l in b.get("lines", []) for s in l["spans"]]
+        sizes = [s["size"] for s in spans]
+        right = max((s["bbox"][2] for s in spans), default=0)
+        width = page.rect.width
+    expect(sizes and max(sizes) <= 30,
+           f"{what}: nothing is printed at a runaway size (largest was {max(sizes):.1f}pt)")
+    expect(right <= width,
+           f"{what}: no text runs off the right-hand edge of the paper")
+
 
 def test_exports(store, folder):
     rows = store.employees()
@@ -614,8 +650,11 @@ def test_exports(store, folder):
     from openpyxl import load_workbook
     sheet = load_workbook(xlsx).active
     expect(sheet.max_row == len(rows) + 1, "one header row plus one row per employee")
-    expect(sheet.cell(1, 3).value == "Employee ID", "the header uses the screen labels")
-    expect(sheet.max_column == len(COLUMNS) + 1, "Sno plus every field")
+    expect(sheet.cell(1, 2).value == "Employee ID", "the header uses the screen labels")
+    expect(sheet.max_column == len(COLUMNS), "every field, and no extra counter column")
+    headings = [c.value for c in sheet[1]]
+    expect(len([h for h in headings if str(h).strip().lower() == "sno"]) == 1,
+           "exactly one Sno column - the sheet's own, not a duplicate counter")
 
     pdf = export_pdf(rows, folder / "employees.pdf", subtitle="Self-test")
     expect(pdf.exists() and pdf.stat().st_size > 0, "the PDF should be written")
@@ -625,10 +664,73 @@ def test_exports(store, folder):
     export_excel([{**rows[0], "remarks": "=cmd()"}], folder / "risky.xlsx")
     risky = load_workbook(folder / "risky.xlsx").active
     values = [c.value for c in risky[2]]
-    remarks_cell = values[COLUMNS.index("remarks") + 1]     # +1: column 1 is Sno
+    remarks_cell = values[COLUMNS.index("remarks")]
     expect(str(remarks_cell).startswith("'="), "a formula-looking value is neutralised")
-    blank_cell = values[COLUMNS.index("designation") + 1]   # left blank in this row
+    blank_cell = values[COLUMNS.index("designation")]       # left blank in this row
     expect(blank_cell in (None, ""), "a blank field stays blank, not a stray quote mark")
+
+    # A CSV carries the same columns as the sheet.
+    import csv as _csv
+    csv_path = core.export_csv(rows, folder / "employees.csv")
+    with open(csv_path, encoding="utf-8-sig", newline="") as fh:
+        head = next(_csv.reader(fh))
+    expect(len(head) == len(COLUMNS), "the CSV has no duplicate counter column either")
+
+    # The employee sheet has 30-odd fields and most are blank; printing them all
+    # squeezed every value into a sliver a letter wide, so the PDF drops the
+    # columns nothing fills.
+    sparse = [{**{c: "" for c in COLUMNS}, "emp_id": "E-1", "emp_name": "Only Two"}]
+    kept = core._columns_with_data(sparse, COLUMNS)
+    expect(kept == ["emp_id", "emp_name"], "an all-blank column is left off the printed page")
+    expect(core._columns_with_data([{c: "" for c in COLUMNS}], COLUMNS) == COLUMNS,
+           "but a page with nothing on it at all still prints its headings")
+
+
+def test_fixed_password(folder: Path):
+    """The super admin password is a constant, so a database made by an older
+    build - or one whose password was changed - is put back on it when opened."""
+    path = folder / "fixed.db"
+    store = Store(path)
+    store.bootstrap()
+    expect(store.login(core.SUPERADMIN_USER, core.SUPERADMIN_PASSWORD) == "superadmin",
+           "the fixed password signs in")
+
+    store.reset_superadmin("something-else-entirely")
+    raises(Invalid, lambda: store.login(core.SUPERADMIN_USER, core.SUPERADMIN_PASSWORD),
+           "a changed password really does take effect")
+
+    reopened = Store(path)
+    expect(reopened.bootstrap() is None, "reopening reports no new account")
+    expect(reopened.login(core.SUPERADMIN_USER, core.SUPERADMIN_PASSWORD) == "superadmin",
+           "and puts the fixed password back, so the login is never lost")
+
+
+def test_sno(folder: Path):
+    """Every employee shows a serial number, including rows written before the
+    column existed and rows imported from a sheet that has no Sno of its own."""
+    path = folder / "sno.db"
+    store = Store(path)
+    store.bootstrap()
+    blank = {c: "" for c in COLUMNS}
+    store.add_employee(blank | {"emp_id": "S-1", "sno": "7"}, "system", "superadmin")
+    store.add_employee(blank | {"emp_id": "S-2"}, "system", "superadmin")
+    by_id = {r["emp_id"]: r for r in store.employees()}
+    expect(by_id["S-1"]["sno"] == "7", "a number typed in is kept")
+    expect(by_id["S-2"]["sno"] == "8", "and the next one carries on from it")
+
+    # An import with no Sno column, the way most of the department's sheets are.
+    store.bulk_import([{"emp_id": "S-3", "emp_name": "Imported", "_row": 2}],
+                      actor="system", role="superadmin")
+    expect({r["emp_id"]: r for r in store.employees()}["S-3"]["sno"] == "9",
+           "an imported row is numbered too")
+
+    # An old database: the column was added by a migration, so every row was left
+    # blank. Opening the file fills them in.
+    with store._conn() as c:
+        c.execute("UPDATE employees SET sno=''")
+    filled = Store(path).employees()
+    expect(all(r["sno"].strip() for r in filled), "reopening fills in every missing number")
+    expect(len({r["sno"] for r in filled}) == len(filled), "and no two rows share one")
 
 
 def test_bundle_seed(folder: Path):
@@ -666,11 +768,15 @@ def test_bundle_seed(folder: Path):
 
 def main():
     with tempfile.TemporaryDirectory() as tmp:
+      try:
         folder = Path(tmp)
         store = Store(folder / "test.db")
         user, password = store.bootstrap()
-        expect(user == "superadmin" and len(password) >= 8, "first run creates the super admin")
+        expect(user == core.SUPERADMIN_USER and password == core.SUPERADMIN_PASSWORD,
+               "first run creates the super admin on the fixed password")
         expect(store.login(user, password) == "superadmin", "the printed password works")
+        test_fixed_password(folder)
+        test_sno(folder)
 
         row_id = test_employees(store)
         test_rights(store, row_id)
@@ -688,11 +794,12 @@ def main():
         test_exports(store, folder)
         test_import(folder)
         test_bundle_seed(folder)
-        
-        # Shutdown logging so log files in the temp directory can be deleted on Windows
+      finally:
+        # Close the log file whatever happened, or Windows refuses to delete the
+        # temp folder and the real failure is buried under a PermissionError.
         import logging
         logging.shutdown()
-        
+
     print("self-check OK")
 
 

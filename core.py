@@ -276,11 +276,12 @@ _ITERATIONS = 210_000
 _MAX_FAILS = 5
 _LOCKOUT_SECONDS = 300
 
-# The super admin password is a fixed, known value for now (change it from
-# app/core.py: SUPERADMIN_PASSWORD whenever this is no longer wanted). Every
-# freshly created database - and the --reset-password recovery - uses it, so
-# the login never needs to be hunted for again.
-SUPERADMIN_PASSWORD = "YYcqiwYtUy7G"
+# The super admin login is a fixed, known value (change it here whenever this
+# is no longer wanted). It is re-applied every time the database is opened, so
+# the login never needs to be hunted for and an existing file picks up a change
+# to this constant on the next launch.
+SUPERADMIN_USER = "superadmin"
+SUPERADMIN_PASSWORD = "admin"
 
 # Organisation details for the letterhead printed at the top of each record
 # document. Stored in the database so every PC sharing one database prints the
@@ -303,8 +304,17 @@ def setup_logging(log_dir: Path) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "it_records.log"
     logger = logging.getLogger("itrecords")
-    if logger.handlers:          # already configured (e.g. test re-import)
-        return logger
+    for handler in list(logger.handlers):
+        # Already pointed at this file: nothing to do. Pointed somewhere else
+        # (a second Store, or a test's temp folder): close it first, or the old
+        # file stays locked on Windows and the log goes to the wrong folder.
+        if isinstance(handler, logging.FileHandler):
+            if Path(handler.baseFilename) == log_path.resolve():
+                return logger
+            logger.removeHandler(handler)
+            handler.close()
+        else:
+            logger.removeHandler(handler)
     logger.setLevel(logging.DEBUG)
     # Rotating: max 2 MB, keep 5 old files
     fh = logging.handlers.RotatingFileHandler(
@@ -467,6 +477,8 @@ class Store:
                 if col not in existing_cols:
                     c.execute(f"ALTER TABLE employees ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
+        self._backfill_sno()
+
         # Serials that already sit on employee records are brought into the asset
         # registers with that employee as the current owner, so the tabs are not
         # empty for data people were already keeping. This runs on every open and
@@ -586,6 +598,33 @@ class Store:
                             f"{who} ({held['current_emp_id']}) - release or reassign it first")
         return None
 
+    def _backfill_sno(self) -> None:
+        """Give every employee a serial number.
+
+        `sno` was added after the first databases were in use, so an ALTER TABLE
+        left every existing row with an empty one - and an imported sheet without
+        a Sno column does the same. Rows that already carry a number keep it (it
+        is the number the department's own sheet uses); the blanks are filled in
+        record order, continuing past the highest number already taken.
+        """
+        with self._conn() as c:
+            blanks = [r["id"] for r in c.execute(
+                "SELECT id FROM employees WHERE TRIM(sno)='' ORDER BY id")]
+            if not blanks:
+                return
+            taken = {str(r["sno"]).strip() for r in c.execute(
+                "SELECT sno FROM employees WHERE TRIM(sno)<>''")}
+            nums = {int(t) for t in taken if t.isdigit()}
+            nxt = max(nums, default=0) + 1
+            for row_id in blanks:
+                c.execute("UPDATE employees SET sno=? WHERE id=?", (str(nxt), row_id))
+                nxt += 1
+        _log.info("Filled in %d missing serial number(s)", len(blanks))
+
+    def _next_sno(self, c) -> str:
+        highest = c.execute("SELECT MAX(CAST(sno AS INTEGER)) FROM employees").fetchone()[0]
+        return str((highest or 0) + 1)
+
     def add_employee(self, data: dict, actor: str, role: str) -> int:
         self._require(role, "edit")
         data = self._clean(data)
@@ -595,9 +634,7 @@ class Store:
         stamp = now()
         with self._conn() as c:
             if not data.get("sno"):
-                max_sno = c.execute("SELECT MAX(CAST(sno AS INTEGER)) FROM employees").fetchone()[0]
-                data["sno"] = str((max_sno or 0) + 1)
-            
+                data["sno"] = self._next_sno(c)
             cols = list(data) + ["created", "updated", "created_by", "updated_by"]
             values = list(data.values()) + [stamp, stamp, actor, actor]
             try:
@@ -830,8 +867,11 @@ class Store:
                 "INSERT INTO assignments (asset_id, emp_id, emp_name, assigned_on, note, actor, at) "
                 "VALUES (?,?,?,?,?,?,?)",
                 (asset_id, emp["emp_id"], emp["emp_name"], start, note, actor, now()))
-            c.execute("UPDATE assets SET current_emp_id=?, current_emp_name=?, updated=?, updated_by=? "
-                      "WHERE id=?",
+            # Someone holds it now, so it is in use - unless it is being tracked
+            # as away for repair or retired, which the register should keep saying.
+            c.execute("UPDATE assets SET current_emp_id=?, current_emp_name=?, "
+                      "status=CASE WHEN status IN ('Repair', 'Retired') THEN status "
+                      "ELSE 'In use' END, updated=?, updated_by=? WHERE id=?",
                       (emp["emp_id"], emp["emp_name"], now(), actor, asset_id))
             self._sync_employee(c, asset_id, emp["emp_id"])
         self.log(actor, "assign", ASSET_META[kind]["entity"], asset["identity"], summary)
@@ -863,8 +903,11 @@ class Store:
             c.execute("UPDATE assignments SET released_on=?, note=CASE WHEN note='' THEN ? ELSE note END "
                       "WHERE asset_id=? AND released_on=''",
                       (today, note, asset["id"]))
-            c.execute("UPDATE assets SET current_emp_id='', current_emp_name='', updated=?, updated_by=? "
-                      "WHERE id=?",
+            # Nobody holds it any more, so it is back in stock. Repair and Retired
+            # are deliberate states and are left alone.
+            c.execute("UPDATE assets SET current_emp_id='', current_emp_name='', "
+                      "status=CASE WHEN status='In use' THEN 'Spare' ELSE status END, "
+                      "updated=?, updated_by=? WHERE id=?",
                       (now(), actor, asset["id"]))
             for asset_col, emp_col in ASSET_META[kind]["sync"].items():
                 value = asset.get(asset_col, "")
@@ -1116,6 +1159,7 @@ class Store:
         stamp = now()
         audit_rows: list = []
         with self._conn() as c:
+            next_sno = self._next_sno(c)
             for row in rows:
                 record = {k: str(v).strip() for k, v in row.items() if k in COLUMNS}
                 where = f"Row {row.get('_row', '?')}"
@@ -1146,6 +1190,9 @@ class Store:
                 try:
                     if current is None:
                         data = self._clean(record)
+                        if not data.get("sno"):
+                            data["sno"] = next_sno
+                            next_sno = str(int(next_sno) + 1)
                         cols = list(data) + ["created", "updated", "created_by", "updated_by"]
                         values = list(data.values()) + [stamp, stamp, actor, actor]
                         try:
@@ -1371,15 +1418,24 @@ class Store:
         was deleted or downgraded - otherwise nobody could ever sign in again.
         """
         with self._conn() as c:
+            row = c.execute("SELECT hash FROM users WHERE username=? AND role='superadmin'",
+                            (SUPERADMIN_USER,)).fetchone()
+        if row is not None:
+            # The password is a hardcoded constant, so an account left over from an
+            # older build (or one whose password was changed) is put back on it.
+            if verify_password(SUPERADMIN_PASSWORD, row["hash"]):
+                return None
+            with self._conn() as c:
+                c.execute("UPDATE users SET hash=? WHERE username=?",
+                          (hash_password(SUPERADMIN_PASSWORD), SUPERADMIN_USER))
+            self.log("system", "password", "user", SUPERADMIN_USER, "reset to the fixed password")
+            return None
+        with self._conn() as c:
             has_boss = c.execute(
                 "SELECT 1 FROM users WHERE role='superadmin' LIMIT 1").fetchone() is not None
         if has_boss:
             return None
-        password = SUPERADMIN_PASSWORD
-        if self.has_users():
-            return self.reset_superadmin(password)
-        self._insert_user("superadmin", password, "superadmin", "system")
-        return "superadmin", password
+        return self.reset_superadmin(SUPERADMIN_PASSWORD)
 
     def create_user(self, username: str, password: str, role: str, actor: str, actor_role: str) -> None:
         self._require(actor_role, "users")
@@ -1674,10 +1730,14 @@ def export_excel(rows: list[dict], path: Path | str, columns: list[str] | None =
 
     columns = columns or COLUMNS
     labels = labels or LABELS
+    # The employee sheet carries its own Sno field; counting the rows off as well
+    # put two columns called Sno side by side, disagreeing with each other.
+    numbered = "sno" not in columns
     book = Workbook()
     sheet = book.active
     sheet.title = "Sheet1"
-    sheet.append(["Sno"] + [labels.get(c, c.replace("_", " ").title()) for c in columns])
+    sheet.append((["Sno"] if numbered else [])
+                 + [labels.get(c, c.replace("_", " ").title()) for c in columns])
 
     head_fill = PatternFill("solid", fgColor="006A63")
     for cell in sheet[1]:
@@ -1686,13 +1746,14 @@ def export_excel(rows: list[dict], path: Path | str, columns: list[str] | None =
         cell.alignment = Alignment(vertical="center")
 
     for n, row in enumerate(rows, start=1):
-        sheet.append([n] + [_cell(row.get(c, "")) for c in columns])
+        sheet.append(([n] if numbered else []) + [_cell(row.get(c, "")) for c in columns])
 
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
     for column in sheet.columns:
         width = max(len(str(c.value or "")) for c in column)
         sheet.column_dimensions[column[0].column_letter].width = min(max(width + 2, 10), 40)
+    sheet.row_dimensions[1].height = 22
 
     path = Path(path)
     book.save(path)
@@ -1820,12 +1881,13 @@ def export_csv(rows: list[dict], path: Path | str, columns: list[str] | None = N
 
     columns = columns or COLUMNS
     labels = labels or LABELS
+    numbered = "sno" not in columns
     path = Path(path)
     with open(path, "w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["Sno"] + [labels.get(c, c) for c in columns])
+        writer.writerow((["Sno"] if numbered else []) + [labels.get(c, c) for c in columns])
         for n, row in enumerate(rows, start=1):
-            writer.writerow([n] + [row.get(c, "") for c in columns])
+            writer.writerow(([n] if numbered else []) + [row.get(c, "") for c in columns])
     return path
 
 
@@ -1843,10 +1905,26 @@ def _cell(value):
 _QT_APP = None
 
 
+def _columns_with_data(rows: list[dict], columns: list[str]) -> list[str]:
+    """Only the columns that actually hold something in these rows.
+
+    The employee sheet has 30-odd fields and most sites fill a dozen; printing
+    the empty ones squeezes the rest into slivers a word wide.
+    """
+    kept = [c for c in columns if any(str(r.get(c, "") or "").strip() for r in rows)]
+    return kept or list(columns)
+
+
 def export_pdf(rows: list[dict], path: Path | str, columns: list[str] | None = None,
                labels: dict[str, str] | None = None,
                title: str = "Employee Records", subtitle: str = "") -> Path:
-    """Uses Qt's own PDF writer - no extra PDF library needed."""
+    """Uses Qt's own PDF writer - no extra PDF library needed.
+
+    The page is chosen to fit the columns rather than the other way round: empty
+    columns are dropped, a wide register goes on A3 instead of A4, and the type
+    size steps down as the column count climbs. Qt adds a fixed 2cm of its own
+    margin on top of the printer's, so the printer margin is left at zero.
+    """
     from html import escape
     from PyQt5.QtCore import QMarginsF
     from PyQt5.QtGui import QPageLayout, QPageSize, QTextDocument
@@ -1859,29 +1937,41 @@ def export_pdf(rows: list[dict], path: Path | str, columns: list[str] | None = N
         global _QT_APP
         _QT_APP = QApplication(["it-records"])
 
-    columns = columns or COLUMNS
+    columns = _columns_with_data(rows, columns or COLUMNS)
     labels = labels or LABELS
+
+    # One "Sno" column only: use the stored serial number when the register has
+    # one, otherwise count the rows off.
+    numbered = "sno" not in columns
+    width = len(columns) + (1 if numbered else 0)
+    page = QPageSize.A3 if width > 14 else QPageSize.A4
+    orientation = QPageLayout.Portrait if width <= 7 else QPageLayout.Landscape
+    font, pad = (7.5, 4) if width <= 10 else (6.0, 3) if width <= 18 else (5.0, 2)
+
     head = "".join(f"<th>{escape(labels.get(c, c))}</th>" for c in columns)
     body = "".join(
-        "<tr><td>{}</td>{}</tr>".format(
-            n, "".join(f"<td>{escape(str(row.get(c, '') or ''))}</td>" for c in columns)
+        "<tr>{}{}</tr>".format(
+            f"<td>{n}</td>" if numbered else "",
+            "".join(f"<td>{escape(str(row.get(c, '') or ''))}</td>" for c in columns),
         )
         for n, row in enumerate(rows, start=1)
     )
     html = f"""
     <html><head><meta charset="utf-8"><style>
-      body {{ font-family: "Segoe UI", sans-serif; font-size: 7pt; color: #14211f; }}
-      h1 {{ color: #004f49; font-size: 14pt; margin: 0; }}
-      .sub {{ color: #5f7472; font-size: 8pt; margin: 2px 0 10px; }}
+      body {{ font-family: "Segoe UI", sans-serif; font-size: {font}pt; color: #14211f; }}
+      h1 {{ color: #004f49; font-size: 13pt; margin: 0; }}
+      .sub {{ color: #5f7472; font-size: {font + 1}pt; margin: 2px 0 8px; }}
       table {{ border-collapse: collapse; width: 100%; }}
-      th {{ background: #006a63; color: #fff; text-align: left; padding: 4px; border-bottom: 2px solid #ffd100; }}
-      td {{ padding: 3px 4px; border-bottom: 1px solid #d9e2e1; }}
+      th {{ background: #006a63; color: #fff; text-align: left; padding: {pad}px;
+            font-size: {font}pt; border-bottom: 2px solid #ffd100; }}
+      td {{ padding: {pad - 1}px {pad}px; border-bottom: 1px solid #d9e2e1; }}
       tr:nth-child(even) td {{ background: #f2f8f7; }}
     </style></head><body>
       <h1>{escape(title)}</h1>
       <p class="sub">{escape(subtitle)}{' &middot; ' if subtitle else ''}{len(rows)} record(s)
          &middot; {escape(local_time(now()))}</p>
-      <table><thead><tr><th>Sno</th>{head}</tr></thead><tbody>{body}</tbody></table>
+      <table width="100%"><thead><tr>{'<th>Sno</th>' if numbered else ''}{head}</tr></thead>
+        <tbody>{body}</tbody></table>
     </body></html>"""
 
     path = Path(path)
@@ -1889,10 +1979,13 @@ def export_pdf(rows: list[dict], path: Path | str, columns: list[str] | None = N
     printer.setOutputFormat(QPrinter.PdfFormat)
     printer.setOutputFileName(str(path))
     printer.setPageLayout(QPageLayout(
-        QPageSize(QPageSize.A4), QPageLayout.Landscape, QMarginsF(10, 10, 10, 10), QPageLayout.Millimeter))
+        QPageSize(page), orientation, QMarginsF(0, 0, 0, 0), QPageLayout.Millimeter))
 
     document = QTextDocument()
+    document.setDefaultStyleSheet("")
     document.setHtml(html)
+    # No setPageSize(): with one set, Qt scales the whole layout to the paper and
+    # every point size comes out wrong. Left alone it lays out at true size.
     document.print_(printer)
     return path
 
@@ -1979,7 +2072,7 @@ def export_record_pdf(title: str, fields: list[tuple[str, str]],
     printer.setOutputFormat(QPrinter.PdfFormat)
     printer.setOutputFileName(str(path))
     printer.setPageLayout(QPageLayout(
-        QPageSize(QPageSize.A4), QPageLayout.Portrait, QMarginsF(12, 10, 12, 10),
+        QPageSize(QPageSize.A4), QPageLayout.Portrait, QMarginsF(0, 0, 0, 0),
         QPageLayout.Millimeter))
     document.print_(printer)
     return path
@@ -1994,7 +2087,7 @@ def _record_document(title: str, fields: list[tuple[str, str]],
     """The formal record as a laid-out A4 QTextDocument (letterhead margins and
     all) - shared by the PDF writer and any on-screen rendering."""
     from html import escape
-    from PyQt5.QtCore import QSizeF, QUrl
+    from PyQt5.QtCore import QUrl
     from PyQt5.QtGui import QTextDocument
 
     company = {**COMPANY_DEFAULTS, **(company or {})}
@@ -2004,15 +2097,16 @@ def _record_document(title: str, fields: list[tuple[str, str]],
     e = escape
     generated = local_time(now())
 
-    cells = []
-    for label, value in fields:
-        cells.append(f'<td class="lbl">{e(label)}</td>'
-                     f'<td class="val">{e(str(value or ""))}</td>')
-    if len(cells) % 4:
+    # Two label/value pairs to a row. Four pairs (the old layout) gave each label
+    # 20% of the page, which is not enough for "Laptop Serial Number" - every
+    # heading broke across three lines and the row overflowed the paper.
+    cells = [f'<td class="lbl">{e(label)}</td><td class="val">{e(str(value or ""))}</td>'
+             for label, value in fields]
+    if len(cells) % 2:
         cells.append('<td class="lbl">&nbsp;</td><td class="val">&nbsp;</td>')
     field_grid = "".join(
-        "<tr>" + "".join(cells[i:i + 4]) + "</tr>"
-        for i in range(0, len(cells), 4)) or "<tr><td colspan=4 style='color:#5f7472'>No details recorded yet.</td></tr>"
+        "<tr>" + "".join(cells[i:i + 2]) + "</tr>"
+        for i in range(0, len(cells), 2)) or "<tr><td colspan=4 style='color:#5f7472'>No details recorded yet.</td></tr>"
 
     history_html = ""
     if history:
@@ -2030,7 +2124,7 @@ def _record_document(title: str, fields: list[tuple[str, str]],
           <h2>Ownership history</h2>
           <p class="hint">Who has held this item, in order, and when. The open line
           (no release date) is the current holder.</p>
-          <table class="data"><thead><tr><td>Holder</td><td>From</td><td>Until</td>
+          <table class="data" width="100%"><thead><tr><td>Holder</td><td>From</td><td>Until</td>
             <td>Note</td></tr></thead>{body}</table>"""
 
     prepared = e(prepared_by or "IT Records")
@@ -2052,42 +2146,45 @@ def _record_document(title: str, fields: list[tuple[str, str]],
                             border-bottom: 2px solid #ffd100; }}
       table.data tr.current td {{ background: #e8f4f2; font-weight: 600; }}
       .now {{ color: #00707a; font-size: 7pt; }}
-      td.lbl {{ font-weight: 600; color: #004f49; padding: 4px 6px 4px 0; width: 20%; }}
-      td.val {{ padding: 4px 8px 4px 0; width: 30%; border-bottom: 1px dotted #cfdcdb; }}
+      td.lbl {{ font-weight: 600; color: #004f49; padding: 5px 6px 5px 0; width: 17%; }}
+      td.val {{ padding: 5px 14px 5px 0; width: 33%; border-bottom: 1px dotted #cfdcdb; }}
       .sigbox {{ padding-top: 14px; font-size: 9pt; }}
-      .line {{ border-top: 1px solid #14211f; margin-top: 34px; padding-top: 3px;
-               color: #5f7472; font-size: 7.5pt; }}
-      .footnote {{ color: #5f7472; font-size: 7pt; margin-top: 12px;
-                   border-top: 1px solid #cfdcdb; padding-top: 6px; }}
+      .line {{ color: #5f7472; font-size: 7.5pt; }}
+      .footnote {{ color: #5f7472; font-size: 7pt; margin-top: 12px; }}
+      hr {{ height: 1px; }}
     </style></head><body>
-      <table class="head"><tr>
-        <td>
+      <table class="head" width="100%"><tr>
+        <td width="70%">
           <div style="font-family:'Segoe UI'; font-size:20pt; font-weight:800; color:#006a63;">{e(name)}</div>
           <div class="hint">{e(head_line)}<br/>{e(contact)}</div>
         </td>
-        <td align="right" width="30%">{'' if not subtitle else f'<div class="hint" style="text-align:right">{e(subtitle)}</div>'}</td>
+        <td width="30%" align="right"><div class="hint">{e(generated)}</div></td>
       </tr></table>
-      <div style="border-bottom:3px solid #006a63; margin:6px 0 14px;"></div>
+      <hr color="#006a63" size="3"/>
       <div class="doc">{e(title)}</div>
-      <div class="meta">{('Ref: ' + doc_no + ' &middot; ') if doc_no else ''}Prepared on {e(generated)}</div>
-      <table>{field_grid}</table>
+      <div class="meta">{e(subtitle)}{' &middot; ' if subtitle and doc_no else ''}{('Ref: ' + doc_no) if doc_no else ''}</div>
+      <table width="100%">{field_grid}</table>
       {history_html}
       <table class="sig"><tr>
-        <td width="55%" class="sigbox">Prepared by: <b>{prepared}</b>
-          <div class="line">Prepared by - signature</div></td>
-        <td align="right" class="sigbox"><img src="seal://seal" width="165" height="165"></td>
-        <td width="45%" class="sigbox"><div style="height:1px">&nbsp;</div>
-          <div class="line">Authorised signature+date <span class="seal">&nbsp;&nbsp;{e(name)}</span></div></td>
+        <td width="38%" class="sigbox">Prepared by: <b>{prepared}</b>
+          <hr color="#14211f"/><div class="line">Prepared by - signature</div></td>
+        <td width="24%" align="center" class="sigbox">
+          <img src="seal://seal" width="110" height="110"></td>
+        <td width="38%" class="sigbox">&nbsp;
+          <hr color="#14211f"/><div class="line">Authorised signature &amp; date
+            <span class="seal">&nbsp;{e(name)}</span></div></td>
       </tr></table>
+      <hr color="#cfdcdb"/>
       <div class="footnote">{e(name)} &middot; Information Technology &mdash; record generated by IT Records
         {('&middot; Ref ' + doc_no) if doc_no else ''}</div>
     </body></html>"""
 
-    mm = 72 / 25.4
     document = QTextDocument()
     document.addResource(QTextDocument.ImageResource, QUrl("seal://seal"),
                          _seal_pixmap(company.get("name") or "IT Records"))
-    document.setPageSize(QSizeF(210 * mm, 297 * mm))
+    # Deliberately no setPageSize(): Qt then scales the finished layout onto the
+    # paper and every point size lands ~1.8x too large, with the right-hand side
+    # cut off. Left unset, the document prints at the size the stylesheet asks for.
     document.setHtml(html)
     return document
 

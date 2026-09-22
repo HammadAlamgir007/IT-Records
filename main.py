@@ -262,8 +262,8 @@ class EmailConfigDialog(QDialog):
         
         self.server = QLineEdit(self.settings.value("smtp_server", "smtp.gmail.com"))
         self.port = QLineEdit(self.settings.value("smtp_port", "587"))
-        self.email = QLineEdit(self.settings.value("smtp_email", ""))
-        self.password = QLineEdit(self.settings.value("smtp_password", ""))
+        self.email = QLineEdit(self.settings.value("smtp_email", "hammadalamgir778@gmail.com"))
+        self.password = QLineEdit(self.settings.value("smtp_password", "qxab wjpx xvje orma"))
         self.password.setEchoMode(QLineEdit.Password)
         
         form.addRow("SMTP Server:", self.server)
@@ -657,7 +657,10 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.stack, 1)
 
         self.status = self.statusBar()
-        self.status.showMessage("Open read-only. Sign in as super admin to make changes.")
+        self.status.showMessage(
+            f"Signed in as {self.username} - {ROLES.get(self.role, self.role)}."
+            if Store.may(self.role, "edit")
+            else "Open read-only. Sign in as super admin to make changes.")
         self._shortcuts()
         self.refresh()
         for kind in ASSET_META:
@@ -902,7 +905,7 @@ class MainWindow(QMainWindow):
         button("Import Excel", self.import_excel, "ghost", right="import")
         button("Email Settings", self.email_settings, "ghost", right="superadmin")
         button("Send Email", self.compose_email, "ghost")
-        button("Bulk Email", self.bulk_email, "ghost", right="edit")
+
         self.export_buttons = [
             button("Export Excel", self.export_excel, "ghost", right="export"),
             button("Export CSV", self.export_csv, "ghost", right="export"),
@@ -949,8 +952,14 @@ class MainWindow(QMainWindow):
             values = [str(row[c]) for c in COLUMNS] + \
                      [local_time(row["updated"]), row["updated_by"]]
             for c, value in enumerate(values):
-                self.table.setItem(r, c, QTableWidgetItem(value))
-        
+                item = QTableWidgetItem(value)
+                if c == 0:
+                    # The table sorts, so the row number on screen is not a
+                    # position in self.rows - carry the real one, or Edit,
+                    # Delete and Print Record act on the wrong employee.
+                    item.setData(Qt.UserRole, r)
+                self.table.setItem(r, c, item)
+
         # Sort by join_date (index 2 in COLUMNS)
         self.table.sortItems(2, Qt.AscendingOrder)
         self.table.setSortingEnabled(True)
@@ -961,18 +970,31 @@ class MainWindow(QMainWindow):
             button.setEnabled(bool(self.rows))
             button.setToolTip("" if self.rows else "Nothing to export - the list is empty")
 
+    @staticmethod
+    def _record_at(table, source: list, view_row: int) -> dict | None:
+        """The record a visual row stands for. Clicking a column header reorders
+        the table, so the row number on screen is not an index into the list the
+        rows were built from; the index is carried on the row itself."""
+        item = table.item(view_row, 0)
+        index = item.data(Qt.UserRole) if item is not None else None
+        if index is None:
+            index = view_row
+        return source[index] if 0 <= index < len(source) else None
+
     def selected(self) -> dict | None:
         rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
         if not rows:
             warn(self, "Select an employee row first.")
             return None
-        return self.rows[rows[0].row()]
+        return self._record_at(self.table, self.rows, rows[0].row())
 
     def selected_records(self) -> list[dict]:
         model = self.table.selectionModel()
         if not model:
             return []
-        return [self.rows[idx.row()] for idx in model.selectedRows()]
+        picked = (self._record_at(self.table, self.rows, idx.row())
+                  for idx in model.selectedRows())
+        return [r for r in picked if r is not None]
 
     def select_all_employees(self):
         self.table.selectAll()
@@ -1046,73 +1068,6 @@ class MainWindow(QMainWindow):
         dialog = ComposeEmailDialog(self, to_email)
         dialog.exec_()
 
-    def bulk_email(self):
-        records = self.selected_records()
-        if not records:
-            records = self.rows
-        recipients = [r.get("email", "") for r in records if r.get("email", "").strip()]
-        if not recipients:
-            warn(self, "None of the selected employees have an email address on file.")
-            return
-        
-        settings = QSettings("ITRecords", "Settings")
-        if not settings.value("smtp_server", ""):
-            if QMessageBox.question(self, "Email not configured",
-                                    "Email settings are not configured. Open Email Settings now?",
-                                    QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-                self.email_settings()
-            return
-
-        subject, ok = QInputDialog.getText(self, "Bulk Email",
-                                           f"Subject (sending to {len(recipients)} recipients):")
-        if not ok or not subject.strip():
-            return
-        
-        from PyQt5.QtWidgets import QTextEdit as _  # noqa — already top-level
-        body_dialog = QDialog(self)
-        body_dialog.setWindowTitle("Compose Bulk Email")
-        body_dialog.resize(480, 320)
-        bl = QVBoxLayout(body_dialog)
-        body_box = QTextEdit()
-        body_box.setPlaceholderText("Type your message here...")
-        bl.addWidget(QLabel(f"Sending to {len(recipients)} employee(s):"))
-        bl.addWidget(QLabel(", ".join(recipients[:5]) + ("..." if len(recipients) > 5 else "")))
-        bl.addWidget(body_box)
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.button(QDialogButtonBox.Ok).setText("Send")
-        btns.accepted.connect(body_dialog.accept)
-        btns.rejected.connect(body_dialog.reject)
-        bl.addWidget(btns)
-        if body_dialog.exec_() != QDialog.Accepted:
-            return
-        body_text = body_box.toPlainText().strip()
-        if not body_text:
-            return
-        
-        server = settings.value("smtp_server", "")
-        port = settings.value("smtp_port", "587")
-        email_addr = settings.value("smtp_email", "")
-        password = settings.value("smtp_password", "")
-        sent, failed = 0, 0
-        for addr in recipients:
-            try:
-                msg = EmailMessage()
-                msg['Subject'] = subject
-                msg['From'] = email_addr
-                msg['To'] = addr
-                msg.set_content(body_text)
-                with smtplib.SMTP(server, int(port)) as s:
-                    s.starttls()
-                    s.login(email_addr, password)
-                    s.send_message(msg)
-                sent += 1
-            except Exception:
-                failed += 1
-        msg_text = f"Sent {sent} email(s) successfully."
-        if failed:
-            msg_text += f" {failed} failed."
-        QMessageBox.information(self, "Bulk Email Complete", msg_text)
-        self.status.showMessage(msg_text, 6000)
 
     def delete_selected_employees(self):
         if not self.ensure("delete", "Sign in as a super admin to delete employees."):
@@ -1223,7 +1178,7 @@ class MainWindow(QMainWindow):
         button("Assign", lambda _=None, k=kind: self.assign_asset(k), "ghost", right="edit")
         button("Release", lambda _=None, k=kind: self.release_asset(k), "ghost", right="edit")
         button("History", lambda _=None, k=kind: self.show_asset_history(k), "ghost")
-        button("QR Code", lambda _=None, k=kind: self.show_qr_code(k), "ghost")
+
         button("Print Record", lambda _=None, k=kind: self.record_asset(k), "ghost",
                right="export")
         button("Delete", lambda _=None, k=kind: self.delete_asset(k), "danger", right="delete")
@@ -1263,7 +1218,10 @@ class MainWindow(QMainWindow):
             values = [str(r + 1)] + [row[c] for c in meta["columns"]] + \
                      [local_time(row["updated"]), row["updated_by"]]
             for c, value in enumerate(values):
-                table.setItem(r, c, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                if c == 0:
+                    item.setData(Qt.UserRole, r)      # survives a header-click sort
+                table.setItem(r, c, item)
         table.setSortingEnabled(True)
         table.resizeColumnsToContents()
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -1275,40 +1233,8 @@ class MainWindow(QMainWindow):
         if not selected_rows:
             warn(self, "Select an asset row first.")
             return None
-        return self.asset_rows[kind][selected_rows[0].row()]
+        return self._record_at(table, self.asset_rows[kind], selected_rows[0].row())
 
-    def show_qr_code(self, kind: str):
-        asset = self._selected_asset(kind)
-        if not asset:
-            return
-        identity = asset.get("identity", "")
-        name_type = asset.get("name_type", "")
-        qr_text = f"{ASSET_META[kind]['label']}\nSerial: {identity}\nModel: {name_type}"
-        try:
-            import qrcode
-            from io import BytesIO
-            from PyQt5.QtGui import QPixmap
-            img = qrcode.make(qr_text)
-            buf = BytesIO()
-            img.save(buf, format="PNG")
-            buf.seek(0)
-            pixmap = QPixmap()
-            pixmap.loadFromData(buf.read())
-
-            qr_dialog = QDialog(self)
-            qr_dialog.setWindowTitle(f"QR Code - {identity}")
-            qr_layout = QVBoxLayout(qr_dialog)
-            label = QLabel()
-            label.setPixmap(pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            label.setAlignment(Qt.AlignCenter)
-            qr_layout.addWidget(label)
-            qr_layout.addWidget(QLabel(qr_text, alignment=Qt.AlignCenter))
-            close_btn = QPushButton("Close")
-            close_btn.clicked.connect(qr_dialog.accept)
-            qr_layout.addWidget(close_btn)
-            qr_dialog.exec_()
-        except ImportError:
-            warn(self, "The 'qrcode' package is not installed.\nRun: pip install qrcode[pil]")
 
     def add_asset(self, kind: str):
         if not self.ensure("edit", "Sign in as a super admin to add assets."):

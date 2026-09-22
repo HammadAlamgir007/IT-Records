@@ -1,9 +1,24 @@
+# Python
 __pycache__/
 *.pyc
+.venv/
+venv/
+
+# PyInstaller: both are rebuilt by `python -m PyInstaller "IT Records.spec"`.
 build/
 dist/
 *.spec
-.venv/
-venv/
+# ...except the one that does the building, which belongs in the repo.
+# (No trailing comments in this file - git would read them as part of the pattern.)
+!IT Records.spec
+
+# The packaged .zip is 50 MB of build output, not source.
+*.zip
+
+# Source sheets and databases hold real staff detail - kept out of the repo.
 *.xlsx
 *.xls
+*.db
+*.bak
+it_records.log*
+YOUR-DATA/
