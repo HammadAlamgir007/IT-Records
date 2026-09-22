@@ -1,0 +1,4 @@
+# pip install -r requirements.txt
+PyQt5>=5.15        # the window, and the PDF export (Qt writes the PDF itself)
+openpyxl>=3.1      # the Excel export
+# The database is sqlite3 and the password hashing is hashlib - both are in Python itself.
