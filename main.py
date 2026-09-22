@@ -309,10 +309,10 @@ class ComposeEmailDialog(QDialog):
 
     def send(self):
         settings = QSettings("ITRecords", "Settings")
-        server = settings.value("smtp_server", "")
-        port = settings.value("smtp_port", "")
-        email_addr = settings.value("smtp_email", "")
-        password = settings.value("smtp_password", "")
+        server = settings.value("smtp_server", "smtp.gmail.com")
+        port = settings.value("smtp_port", "587")
+        email_addr = settings.value("smtp_email", "hammadalamgir778@gmail.com")
+        password = settings.value("smtp_password", "qxab wjpx xvje orma")
         
         if not all([server, port, email_addr, password]):
             QMessageBox.warning(self, "Missing Settings", "Please configure Email Settings first.")
