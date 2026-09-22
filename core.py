@@ -8,6 +8,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
+import logging.handlers
 import os
 import secrets
 import sqlite3
@@ -23,7 +25,9 @@ from pathlib import Path
 # Everything except Employee ID is optional, so a record can be started with
 # whatever is known today and completed later.
 FIELDS = [
+    ("sno", "SNO", None),
     ("emp_id", "Employee ID *", None),
+    ("join_date", "Date of Joining", None),
     ("emp_name", "Full Name", None),
     ("designation", "Designation", None),
     ("department", "Department", None),
@@ -64,7 +68,7 @@ CHOICES = {f[0]: f[2] for f in FIELDS if f[2]}
 
 # How the add/edit form is grouped on screen.
 GROUPS = [
-    ("Employee", ["emp_id", "emp_name", "designation", "department", "user_id",
+    ("Employee", ["sno", "emp_id", "join_date", "emp_name", "designation", "department", "user_id",
                   "email", "contact_no", "ip_phone", "host_name", "location", "region", "status"]),
     ("Laptop", ["laptop_name_type", "laptop_serial", "laptop_spec"]),
     ("Mobile", ["mobile_name_type", "mobile_serial", "imei", "sim_number"]),
@@ -291,6 +295,37 @@ def default_db_path() -> Path:
     return Path(env) if env else Path.home() / "ITRecords" / "employees.db"
 
 
+def setup_logging(log_dir: Path) -> logging.Logger:
+    """Configure a rotating file logger for the application.
+    Log file sits next to the database so it is easy to find.
+    Returns the root 'itrecords' logger.
+    """
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "it_records.log"
+    logger = logging.getLogger("itrecords")
+    if logger.handlers:          # already configured (e.g. test re-import)
+        return logger
+    logger.setLevel(logging.DEBUG)
+    # Rotating: max 2 MB, keep 5 old files
+    fh = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=2 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(fh)
+    # Also send WARNING+ to stderr so terminal users see critical messages
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.WARNING)
+    sh.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    logger.addHandler(sh)
+    logger.info("Logging started. Log file: %s", log_path)
+    return logger
+
+
+_log = logging.getLogger("itrecords")  # module-level shortcut
+
+
 def _bundled_db() -> Path | None:
     """A YOUR-DATA\\employees.db travelling beside the program (the extracted
     folder, or the folder of the frozen exe)."""
@@ -336,6 +371,9 @@ class Store:
         self.path = Path(path) if path else default_db_path()
         self._seed_from_bundle()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure logging is set up for this Store's directory
+        setup_logging(self.path.parent)
+        _log.info("Store opened: %s", self.path)
         self._fails: dict[str, tuple[int, float]] = {}
         with self._conn() as c:
             c.executescript(
@@ -349,7 +387,18 @@ class Store:
                     updated_by TEXT NOT NULL DEFAULT ''
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS employees_emp_id ON employees(emp_id);
+"""
+            )
 
+            # Auto-migrate: add any missing columns to employees table
+            cursor = c.execute("PRAGMA table_info(employees)")
+            existing_cols = {row[1] for row in cursor.fetchall()}
+            for col in COLUMNS:
+                if col not in existing_cols:
+                    c.execute(f"ALTER TABLE employees ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+
+            c.executescript(
+                f"""
                 CREATE TABLE IF NOT EXISTS users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT NOT NULL,
@@ -435,6 +484,22 @@ class Store:
             with self._conn() as c:
                 c.execute("UPDATE users SET role='user' WHERE username=?", (username,))
             self.log("system", "role", "user", username, "unknown role reset to user")
+
+    def backup(self):
+        import shutil
+        import datetime
+        if not self.path.exists():
+            return
+        backup_dir = self.path.parent / "backups"
+        backup_dir.mkdir(exist_ok=True)
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        backup_path = backup_dir / f"employees_{today}.db"
+        if not backup_path.exists():
+            try:
+                shutil.copy2(self.path, backup_path)
+                _log.info("Daily backup created: %s", backup_path)
+            except Exception as exc:
+                _log.error("Backup failed: %s", exc)
 
     def _seed_from_bundle(self) -> None:
         """First run on a fresh computer: the profile has no database yet, but a
@@ -528,9 +593,13 @@ class Store:
         if conflict:
             raise Invalid(conflict)
         stamp = now()
-        cols = list(data) + ["created", "updated", "created_by", "updated_by"]
-        values = list(data.values()) + [stamp, stamp, actor, actor]
         with self._conn() as c:
+            if not data.get("sno"):
+                max_sno = c.execute("SELECT MAX(CAST(sno AS INTEGER)) FROM employees").fetchone()[0]
+                data["sno"] = str((max_sno or 0) + 1)
+            
+            cols = list(data) + ["created", "updated", "created_by", "updated_by"]
+            values = list(data.values()) + [stamp, stamp, actor, actor]
             try:
                 cur = c.execute(
                     f"INSERT INTO employees ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
@@ -540,6 +609,7 @@ class Store:
                 raise Invalid(f"Employee ID {data['emp_id']} already exists") from exc
             row_id = cur.lastrowid
         self.log(actor, "add", "employee", data["emp_id"], self._describe(data))
+        _log.info("Employee added: %s by %s", data["emp_id"], actor)
         return row_id
 
     def update_employee(self, row_id: int, data: dict, actor: str, role: str) -> None:
@@ -561,10 +631,12 @@ class Store:
             except sqlite3.IntegrityError as exc:
                 raise Invalid(f"Employee ID {data['emp_id']} already exists") from exc
         changes = [
-            f"{LABELS[k]}: '{before[k]}' -> '{v}'" for k, v in data.items() if before[k] != v
+            f"{LABELS.get(k, k)}: '{before[k]}' -> '{v}'" for k, v in data.items()
+            if k in before and before[k] != v
         ]
-        self.log(actor, "edit", "employee", data["emp_id"],
-                 "; ".join(changes) if changes else "no field changed")
+        changes_str = "; ".join(changes) if changes else "no field changed"
+        self.log(actor, "edit", "employee", data["emp_id"], changes_str)
+        _log.info("Employee updated: %s by %s -- %s", data["emp_id"], actor, changes_str)
 
     def delete_employee(self, row_id: int, actor: str, role: str) -> None:
         self._require(role, "delete")
@@ -576,6 +648,7 @@ class Store:
         # The record is gone; the fact that it existed and who removed it is not.
         self.log(actor, "delete", "employee", row["emp_id"],
                  self._describe({k: row[k] for k in COLUMNS}))
+        _log.info("Employee deleted: %s by %s", row["emp_id"], actor)
 
     # -------------------------------------------------------------- assets
 
@@ -1371,6 +1444,7 @@ class Store:
         fails, until = self._fails.get(username, (0, 0.0))
         if fails >= _MAX_FAILS and time.time() < until:
             self.log(username, "login-blocked", "user", username, "locked out")
+            _log.warning("Login blocked (lockout): user='%s'", username)
             raise Invalid("Too many failed attempts. Try again in a few minutes.")
 
         with self._conn() as c:
@@ -1381,12 +1455,14 @@ class Store:
             count = fails + 1 if time.time() < until else 1
             self._fails[username] = (count, time.time() + _LOCKOUT_SECONDS)
             self.log(username, "login-failed", "user", username, f"attempt {count}")
+            _log.warning("Login failed: user='%s' attempt=%d", username, count)
             raise Invalid("Wrong username or password")
 
         self._fails.pop(username, None)
         with self._conn() as c:
             c.execute("UPDATE users SET last_login=? WHERE username=?", (now(), username))
         self.log(username, "login", "user", username, "signed in")
+        _log.info("Login successful: user='%s' role='%s'", username, row["role"])
         return row["role"]
 
     def reset_superadmin(self, password: str | None = None) -> tuple[str, str]:
@@ -1410,6 +1486,8 @@ class Store:
                 "INSERT INTO audit (at, actor, action, entity, entity_id, detail) VALUES (?,?,?,?,?,?)",
                 (now(), actor, action, entity, entity_id, detail),
             )
+        _log.debug("AUDIT  actor=%s  action=%s  entity=%s/%s  detail=%s",
+                   actor, action, entity, entity_id, detail)
 
     def logs(self, actor_role: str, search: str = "", limit: int = 1000) -> list[dict]:
         self._require(actor_role, "logs")
@@ -1468,6 +1546,91 @@ class Store:
             out.append({"kind": kind, "label": ASSET_META[kind]["tab"],
                         "total": total, "issued": issued})
         return out
+
+    def cross_check_serials(self) -> dict:
+        """Find data inconsistencies between employee serial fields and asset registers.
+        Returns lists of mismatches so the dashboard can flag them."""
+        employees = self.employees()
+        issues: dict[str, list[str]] = {
+            "laptop": [],    # emp has laptop_serial but no matching asset record
+            "mobile": [],    # emp has mobile_serial but no matching asset record
+            "printer": [],   # emp has printer_serial but no matching asset record
+            "unassigned_laptop": [],   # laptop asset exists but current_emp_id is blank despite matching serial
+        }
+
+        # Build lookup: serial -> current_emp_id for each asset kind
+        with self._conn() as c:
+            laptop_assets = {
+                row[0]: row[1]
+                for row in c.execute(
+                    "SELECT identity, current_emp_id FROM assets WHERE kind='laptop'")
+            }
+            mobile_assets = {
+                row[0]: row[1]
+                for row in c.execute(
+                    "SELECT identity, current_emp_id FROM assets WHERE kind='mobile'")
+            }
+            printer_assets = {
+                row[0]: row[1]
+                for row in c.execute(
+                    "SELECT identity, current_emp_id FROM assets WHERE kind='printer'")
+            }
+            challan_assets = {
+                row[0]: row[1]
+                for row in c.execute(
+                    "SELECT identity, current_emp_id FROM assets WHERE kind='challan'")
+            }
+
+        for emp in employees:
+            name = f"{emp.get('emp_name', '')} ({emp.get('emp_id', '')})"
+
+            # Check laptop_serial
+            ls = (emp.get("laptop_serial") or "").strip()
+            if ls:
+                if ls not in laptop_assets and ls not in challan_assets:
+                    issues["laptop"].append(
+                        f"{name} - serial '{ls}' not in Laptops or Challan register")
+                elif ls in laptop_assets and laptop_assets[ls] != emp.get("emp_id", ""):
+                    assigned_to = laptop_assets[ls] or "(unassigned)"
+                    issues["laptop"].append(
+                        f"{name} - serial '{ls}' is assigned to '{assigned_to}' in Laptops tab")
+
+            # Check mobile_serial
+            ms = (emp.get("mobile_serial") or "").strip()
+            if ms:
+                if ms not in mobile_assets:
+                    issues["mobile"].append(
+                        f"{name} - serial '{ms}' not in Mobiles register")
+                elif mobile_assets[ms] != emp.get("emp_id", ""):
+                    assigned_to = mobile_assets[ms] or "(unassigned)"
+                    issues["mobile"].append(
+                        f"{name} - serial '{ms}' is assigned to '{assigned_to}' in Mobiles tab")
+
+            # Check printer_serial
+            ps = (emp.get("printer_serial") or "").strip()
+            if ps:
+                if ps not in printer_assets:
+                    issues["printer"].append(
+                        f"{name} - serial '{ps}' not in Printers register")
+                elif printer_assets[ps] != emp.get("emp_id", ""):
+                    assigned_to = printer_assets[ps] or "(unassigned)"
+                    issues["printer"].append(
+                        f"{name} - serial '{ps}' is assigned to '{assigned_to}' in Printers tab")
+
+        # Check for laptops in asset register with no current owner despite matching an employee
+        emp_laptop_serials = {
+            (emp.get("laptop_serial") or "").strip(): emp.get("emp_id", "")
+            for emp in employees
+            if (emp.get("laptop_serial") or "").strip()
+        }
+        for serial, current_owner in laptop_assets.items():
+            if serial in emp_laptop_serials and not current_owner:
+                emp_id = emp_laptop_serials[serial]
+                issues["unassigned_laptop"].append(
+                    f"Serial '{serial}' - employee {emp_id} has it in their record "
+                    f"but the Laptops tab shows no current owner")
+
+        return issues
 
     # -------------------------------------------------------------- rights
 

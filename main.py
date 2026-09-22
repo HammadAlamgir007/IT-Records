@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import sys
+import logging
+import smtplib
+from email.message import EmailMessage
 from pathlib import Path
+
+_log = logging.getLogger("itrecords.ui")
 
 from PyQt5.QtCore import Qt, QSettings, QTimer, QDate
 from PyQt5.QtGui import QFont, QIcon, QKeySequence
@@ -11,8 +16,8 @@ from PyQt5.QtWidgets import (QAbstractItemView, QAction, QApplication, QComboBox
                              QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout,
                              QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
                              QMainWindow, QMessageBox, QPushButton, QScrollArea,
-                             QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
-                             QWidget)
+                             QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit,
+                             QVBoxLayout, QWidget)
 
 import core
 from core import (ASSET_LABELS, ASSET_META, CHOICES, COLUMNS, COMPANY_DEFAULTS, FIELDS, GROUPS,
@@ -137,7 +142,9 @@ class EmployeeDialog(QDialog):
     def __init__(self, parent, record: dict | None = None):
         super().__init__(parent)
         self.setWindowTitle("Edit employee" if record else "Add employee")
-        self.resize(820, 640)
+        # Use WindowMaximized flag so exec_() opens it maximized on Windows
+        self.setWindowFlags(self.windowFlags() | Qt.Window)
+        self.setWindowState(Qt.WindowMaximized)
         self.inputs: dict[str, QWidget] = {}
 
         outer = QVBoxLayout(self)
@@ -151,13 +158,30 @@ class EmployeeDialog(QDialog):
             grid = QGridLayout(group)
             for index, key in enumerate(keys):
                 row, column = divmod(index, 2)
-                if key in CHOICES:
+                if key == "sno":
+                    widget = QLineEdit(str(record.get(key, "")) if record else "")
+                    widget.setReadOnly(True)
+                    widget.setPlaceholderText("Auto-generated")
+                elif key == "join_date":
+                    widget = QDateEdit()
+                    widget.setCalendarPopup(True)
+                    widget.setDisplayFormat("yyyy-MM-dd")
+                    if record and record.get(key):
+                        try:
+                            parts = record[key].split("-")
+                            if len(parts) == 3:
+                                widget.setDate(QDate(int(parts[0]), int(parts[1]), int(parts[2])))
+                        except Exception:
+                            widget.setDate(QDate.currentDate())
+                    else:
+                        widget.setDate(QDate.currentDate())
+                elif key in CHOICES:
                     widget = QComboBox()
                     widget.addItems(CHOICES[key])
                     if record and record.get(key):
                         widget.setCurrentText(record[key])
                 else:
-                    widget = QLineEdit(record.get(key, "") if record else "")
+                    widget = QLineEdit(str(record.get(key, "")) if record else "")
                 self.inputs[key] = widget
                 label = QLabel(dict(((f[0], f[1]) for f in FIELDS))[key])
                 grid.addWidget(label, row, column * 2)
@@ -181,10 +205,28 @@ class EmployeeDialog(QDialog):
         outer.addWidget(buttons)
 
     def values(self) -> dict:
-        return {
-            key: (w.currentText() if isinstance(w, QComboBox) else w.text())
-            for key, w in self.inputs.items()
-        }
+        result = {}
+        for key, w in self.inputs.items():
+            if isinstance(w, QComboBox):
+                result[key] = w.currentText()
+            elif isinstance(w, QDateEdit):
+                result[key] = w.date().toString("yyyy-MM-dd")
+            else:
+                result[key] = w.text()
+        return result
+
+    def accept(self):
+        """Validate before closing."""
+        emp_id_widget = self.inputs.get("emp_id")
+        if emp_id_widget and not emp_id_widget.text().strip():
+            emp_id_widget.setStyleSheet("border: 2px solid #d7282f;")
+            emp_id_widget.setPlaceholderText("Employee ID is required!")
+            warn(self, "Employee ID cannot be empty. Please enter a valid Employee ID.")
+            emp_id_widget.setFocus()
+            return
+        if emp_id_widget:
+            emp_id_widget.setStyleSheet("")
+        super().accept()
 
 
 class PasswordDialog(QDialog):
@@ -208,6 +250,92 @@ class PasswordDialog(QDialog):
             return
         self.accept()
 
+
+class EmailConfigDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Email Settings")
+        self.setMinimumWidth(380)
+        form = QFormLayout(self)
+        
+        self.settings = QSettings("ITRecords", "Settings")
+        
+        self.server = QLineEdit(self.settings.value("smtp_server", "smtp.gmail.com"))
+        self.port = QLineEdit(self.settings.value("smtp_port", "587"))
+        self.email = QLineEdit(self.settings.value("smtp_email", ""))
+        self.password = QLineEdit(self.settings.value("smtp_password", ""))
+        self.password.setEchoMode(QLineEdit.Password)
+        
+        form.addRow("SMTP Server:", self.server)
+        form.addRow("SMTP Port:", self.port)
+        form.addRow("Sender Email:", self.email)
+        form.addRow("App Password:", self.password)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.save)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def save(self):
+        self.settings.setValue("smtp_server", self.server.text())
+        self.settings.setValue("smtp_port", self.port.text())
+        self.settings.setValue("smtp_email", self.email.text())
+        self.settings.setValue("smtp_password", self.password.text())
+        self.accept()
+
+class ComposeEmailDialog(QDialog):
+    def __init__(self, parent, to_email):
+        super().__init__(parent)
+        self.setWindowTitle(f"Compose Email to {to_email}")
+        self.resize(500, 400)
+        self.to_email = to_email
+        
+        box = QVBoxLayout(self)
+        
+        form = QFormLayout()
+        self.subject = QLineEdit()
+        form.addRow("Subject:", self.subject)
+        box.addLayout(form)
+        
+        from PyQt5.QtWidgets import QTextEdit as _QTE  # noqa: F401 — use module-level import
+        self.body = QTextEdit()
+        box.addWidget(self.body)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("Send")
+        btns.accepted.connect(self.send)
+        btns.rejected.connect(self.reject)
+        box.addWidget(btns)
+
+    def send(self):
+        settings = QSettings("ITRecords", "Settings")
+        server = settings.value("smtp_server", "")
+        port = settings.value("smtp_port", "")
+        email_addr = settings.value("smtp_email", "")
+        password = settings.value("smtp_password", "")
+        
+        if not all([server, port, email_addr, password]):
+            QMessageBox.warning(self, "Missing Settings", "Please configure Email Settings first.")
+            return
+
+        try:
+            msg = EmailMessage()
+            msg['Subject'] = self.subject.text()
+            msg['From'] = email_addr
+            msg['To'] = self.to_email
+            msg.set_content(self.body.toPlainText())
+
+            with smtplib.SMTP(server, int(port)) as s:
+                s.starttls()
+                s.login(email_addr, password)
+                s.send_message(msg)
+            
+            _log.info("Email sent to %s subject='%s'", self.to_email, self.subject.text())
+            QMessageBox.information(self, "Success", "Email sent successfully!")
+            self.accept()
+        except Exception as e:
+            _log.error("Email send failed to %s: %s", self.to_email, e)
+            QMessageBox.critical(self, "Error", f"Failed to send email:\n{str(e)}")
 
 class NewUserDialog(QDialog):
     def __init__(self, parent):
@@ -682,7 +810,35 @@ class MainWindow(QMainWindow):
             sign.setObjectName("ghost")
             sign.clicked.connect(self.sign_out)
             row.addWidget(sign)
+
+        # Theme toggle button — always visible in header
+        self.theme_btn = QPushButton()
+        self.theme_btn.setObjectName("ghost")
+        self.theme_btn.setToolTip("Toggle Dark / Light mode")
+        self._update_theme_btn_icon()
+        self.theme_btn.clicked.connect(self.toggle_theme)
+        row.addWidget(self.theme_btn)
         return bar
+
+    def _update_theme_btn_icon(self):
+        theme = self.settings.value("theme", "light")
+        self.theme_btn.setText("Light" if theme == "dark" else "Dark")
+
+    def toggle_theme(self):
+        current = self.settings.value("theme", "light")
+        new_theme = "light" if current == "dark" else "dark"
+        self.settings.setValue("theme", new_theme)
+        try:
+            import qdarktheme
+            if new_theme == "dark":
+                QApplication.instance().setStyleSheet(qdarktheme.load_stylesheet("dark"))
+            else:
+                QApplication.instance().setStyleSheet(STYLE)
+        except (ImportError, Exception):
+            QApplication.instance().setStyleSheet(STYLE)
+        self._update_theme_btn_icon()
+        self.status.showMessage(
+            f"{'Dark' if new_theme == 'dark' else 'Light'} mode enabled.", 3000)
 
     def _rebuild_header(self):
         outer = self.centralWidget().layout()
@@ -744,6 +900,9 @@ class MainWindow(QMainWindow):
         button("Asset History", self.show_employee_assets, "ghost")
         button("Print Record", self.record_employee, "ghost", right="export")
         button("Import Excel", self.import_excel, "ghost", right="import")
+        button("Email Settings", self.email_settings, "ghost", right="superadmin")
+        button("Send Email", self.compose_email, "ghost")
+        button("Bulk Email", self.bulk_email, "ghost", right="edit")
         self.export_buttons = [
             button("Export Excel", self.export_excel, "ghost", right="export"),
             button("Export CSV", self.export_csv, "ghost", right="export"),
@@ -780,17 +939,20 @@ class MainWindow(QMainWindow):
 
     def refresh(self):
         self.rows = self.store.employees(self.search.text())
-        headers = ["Sno"] + [LABELS[c] for c in COLUMNS] + ["Last Updated", "Updated By"]
+        headers = [LABELS[c] for c in COLUMNS] + ["Last Updated", "Updated By"]
         self.table.setSortingEnabled(False)
         self.table.clear()
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
         self.table.setRowCount(len(self.rows))
         for r, row in enumerate(self.rows):
-            values = [str(r + 1)] + [row[c] for c in COLUMNS] + \
+            values = [str(row[c]) for c in COLUMNS] + \
                      [local_time(row["updated"]), row["updated_by"]]
             for c, value in enumerate(values):
                 self.table.setItem(r, c, QTableWidgetItem(value))
+        
+        # Sort by join_date (index 2 in COLUMNS)
+        self.table.sortItems(2, Qt.AscendingOrder)
         self.table.setSortingEnabled(True)
         self.table.resizeColumnsToContents()
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -819,11 +981,13 @@ class MainWindow(QMainWindow):
         if not self.ensure("edit", "Sign in as a super admin to add employees."):
             return
         dialog = EmployeeDialog(self)
-        while dialog.exec_() == QDialog.Accepted:
+        result = dialog.exec_()
+        while result == QDialog.Accepted:
             try:
                 self.store.add_employee(dialog.values(), self.username, self.role)
             except (Invalid, Denied) as exc:
                 warn(dialog, str(exc))
+                result = dialog.exec_()
                 continue
             self.refresh()
             self.status.showMessage("Employee added.", 4000)
@@ -836,11 +1000,13 @@ class MainWindow(QMainWindow):
         if not record:
             return
         dialog = EmployeeDialog(self, record)
-        while dialog.exec_() == QDialog.Accepted:
+        result = dialog.exec_()
+        while result == QDialog.Accepted:
             try:
                 self.store.update_employee(record["id"], dialog.values(), self.username, self.role)
             except (Invalid, Denied) as exc:
                 warn(dialog, str(exc))
+                result = dialog.exec_()
                 continue
             self.refresh()
             self.status.showMessage("Employee updated.", 4000)
@@ -849,23 +1015,104 @@ class MainWindow(QMainWindow):
     def delete_employee(self):
         if not self.ensure("delete", "Sign in as a super admin to delete employees."):
             return
-        record = self.selected()
-        if not record:
+        row = self.selected()
+        if not row:
             return
-        answer = QMessageBox.question(
-            self, "Delete employee",
-            f"Delete {record['emp_name'] or record['emp_id']} ({record['emp_id']})?\n\n"
-            "The record is removed, but the Activity Log keeps a copy of what it held.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if answer != QMessageBox.Yes:
+        if QMessageBox.question(self, "Delete record",
+                                f"Delete the record for {row['emp_name']} ({row['emp_id']})?\n\n"
+                                "Any assets they hold will be released immediately.",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         try:
-            self.store.delete_employee(record["id"], self.username, self.role)
+            self.store.delete_employee(row["id"], self.username, self.role)
         except (Invalid, Denied) as exc:
             warn(self, str(exc))
             return
         self.refresh()
         self.status.showMessage("Employee deleted.", 4000)
+
+    def email_settings(self):
+        dialog = EmailConfigDialog(self)
+        dialog.exec_()
+
+    def compose_email(self):
+        row = self.selected()
+        if not row:
+            return
+        to_email = row.get("email")
+        if not to_email:
+            warn(self, "Selected employee does not have an email address.")
+            return
+        dialog = ComposeEmailDialog(self, to_email)
+        dialog.exec_()
+
+    def bulk_email(self):
+        records = self.selected_records()
+        if not records:
+            records = self.rows
+        recipients = [r.get("email", "") for r in records if r.get("email", "").strip()]
+        if not recipients:
+            warn(self, "None of the selected employees have an email address on file.")
+            return
+        
+        settings = QSettings("ITRecords", "Settings")
+        if not settings.value("smtp_server", ""):
+            if QMessageBox.question(self, "Email not configured",
+                                    "Email settings are not configured. Open Email Settings now?",
+                                    QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+                self.email_settings()
+            return
+
+        subject, ok = QInputDialog.getText(self, "Bulk Email",
+                                           f"Subject (sending to {len(recipients)} recipients):")
+        if not ok or not subject.strip():
+            return
+        
+        from PyQt5.QtWidgets import QTextEdit as _  # noqa — already top-level
+        body_dialog = QDialog(self)
+        body_dialog.setWindowTitle("Compose Bulk Email")
+        body_dialog.resize(480, 320)
+        bl = QVBoxLayout(body_dialog)
+        body_box = QTextEdit()
+        body_box.setPlaceholderText("Type your message here...")
+        bl.addWidget(QLabel(f"Sending to {len(recipients)} employee(s):"))
+        bl.addWidget(QLabel(", ".join(recipients[:5]) + ("..." if len(recipients) > 5 else "")))
+        bl.addWidget(body_box)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("Send")
+        btns.accepted.connect(body_dialog.accept)
+        btns.rejected.connect(body_dialog.reject)
+        bl.addWidget(btns)
+        if body_dialog.exec_() != QDialog.Accepted:
+            return
+        body_text = body_box.toPlainText().strip()
+        if not body_text:
+            return
+        
+        server = settings.value("smtp_server", "")
+        port = settings.value("smtp_port", "587")
+        email_addr = settings.value("smtp_email", "")
+        password = settings.value("smtp_password", "")
+        sent, failed = 0, 0
+        for addr in recipients:
+            try:
+                msg = EmailMessage()
+                msg['Subject'] = subject
+                msg['From'] = email_addr
+                msg['To'] = addr
+                msg.set_content(body_text)
+                with smtplib.SMTP(server, int(port)) as s:
+                    s.starttls()
+                    s.login(email_addr, password)
+                    s.send_message(msg)
+                sent += 1
+            except Exception:
+                failed += 1
+        msg_text = f"Sent {sent} email(s) successfully."
+        if failed:
+            msg_text += f" {failed} failed."
+        QMessageBox.information(self, "Bulk Email Complete", msg_text)
+        self.status.showMessage(msg_text, 6000)
 
     def delete_selected_employees(self):
         if not self.ensure("delete", "Sign in as a super admin to delete employees."):
@@ -976,6 +1223,7 @@ class MainWindow(QMainWindow):
         button("Assign", lambda _=None, k=kind: self.assign_asset(k), "ghost", right="edit")
         button("Release", lambda _=None, k=kind: self.release_asset(k), "ghost", right="edit")
         button("History", lambda _=None, k=kind: self.show_asset_history(k), "ghost")
+        button("QR Code", lambda _=None, k=kind: self.show_qr_code(k), "ghost")
         button("Print Record", lambda _=None, k=kind: self.record_asset(k), "ghost",
                right="export")
         button("Delete", lambda _=None, k=kind: self.delete_asset(k), "danger", right="delete")
@@ -1028,6 +1276,39 @@ class MainWindow(QMainWindow):
             warn(self, "Select an asset row first.")
             return None
         return self.asset_rows[kind][selected_rows[0].row()]
+
+    def show_qr_code(self, kind: str):
+        asset = self._selected_asset(kind)
+        if not asset:
+            return
+        identity = asset.get("identity", "")
+        name_type = asset.get("name_type", "")
+        qr_text = f"{ASSET_META[kind]['label']}\nSerial: {identity}\nModel: {name_type}"
+        try:
+            import qrcode
+            from io import BytesIO
+            from PyQt5.QtGui import QPixmap
+            img = qrcode.make(qr_text)
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            buf.seek(0)
+            pixmap = QPixmap()
+            pixmap.loadFromData(buf.read())
+
+            qr_dialog = QDialog(self)
+            qr_dialog.setWindowTitle(f"QR Code - {identity}")
+            qr_layout = QVBoxLayout(qr_dialog)
+            label = QLabel()
+            label.setPixmap(pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            label.setAlignment(Qt.AlignCenter)
+            qr_layout.addWidget(label)
+            qr_layout.addWidget(QLabel(qr_text, alignment=Qt.AlignCenter))
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(qr_dialog.accept)
+            qr_layout.addWidget(close_btn)
+            qr_dialog.exec_()
+        except ImportError:
+            warn(self, "The 'qrcode' package is not installed.\nRun: pip install qrcode[pil]")
 
     def add_asset(self, kind: str):
         if not self.ensure("edit", "Sign in as a super admin to add assets."):
@@ -1510,7 +1791,7 @@ class MainWindow(QMainWindow):
         box.setContentsMargins(16, 12, 16, 12)
         box.setSpacing(10)
 
-        title = QLabel("A quick health check of the register - everyone can see this.")
+        title = QLabel("Dashboard - A visual overview of your IT records.")
         title.setObjectName("subtitle")
         box.addWidget(title)
 
@@ -1541,30 +1822,115 @@ class MainWindow(QMainWindow):
 
         stats = self.store.stats()
 
-        headline = QLabel(f"<b>{stats['total']}</b> employee/asset record(s) on file")
+        headline = QLabel(f"<b>{stats['total']}</b> employee record(s) on file")
         self.dashboard_layout.addWidget(headline)
 
         grid = QGridLayout()
-        grid.addWidget(self._stat_box(
-            "By status", [f"{name}: {n}" for name, n in stats["by_status"]]), 0, 0)
-        grid.addWidget(self._stat_box(
-            "By region", [f"{name}: {n}" for name, n in stats["by_region"]]), 0, 1)
-        grid.addWidget(self._stat_box(
-            "Top departments", [f"{name}: {n}" for name, n in stats["by_department"]]), 1, 0)
-        grid.addWidget(self._stat_box("Assets on file", [
-            f"With a laptop serial: {stats['with_laptop']}",
-            f"With a mobile serial: {stats['with_mobile']}",
-            f"With a printer serial: {stats['with_printer']}",
-        ]), 1, 1)
+
+        # --- matplotlib charts (optional) ---
+        try:
+            import matplotlib
+            matplotlib.use("Agg")  # non-interactive backend
+            import matplotlib.pyplot as plt
+            from io import BytesIO
+            from PyQt5.QtGui import QPixmap
+
+            def make_bar_chart(data: list, title: str) -> QLabel | None:
+                if not data:
+                    return None
+                labels, values = zip(*data) if data else ([], [])
+                fig, ax = plt.subplots(figsize=(4, 2.5))
+                fig.patch.set_facecolor('#f5f7f7')
+                ax.set_facecolor('#f5f7f7')
+                bars = ax.barh(labels, values, color='#006a63')
+                ax.bar_label(bars, padding=3, fontsize=8)
+                ax.set_title(title, fontsize=9, fontweight='bold')
+                ax.tick_params(labelsize=7)
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                plt.tight_layout()
+                buf = BytesIO()
+                fig.savefig(buf, format='png', dpi=100)
+                plt.close(fig)
+                buf.seek(0)
+                pixmap = QPixmap()
+                pixmap.loadFromData(buf.read())
+                lbl = QLabel()
+                lbl.setPixmap(pixmap)
+                lbl.setAlignment(Qt.AlignCenter)
+                return lbl
+
+            dept_chart = make_bar_chart(stats["by_department"], "Employees by Department")
+            if dept_chart:
+                grid.addWidget(dept_chart, 0, 0)
+
+            region_chart = make_bar_chart(stats["by_region"], "Employees by Region")
+            if region_chart:
+                grid.addWidget(region_chart, 0, 1)
+
+            status_chart = make_bar_chart(stats["by_status"], "Employees by Status")
+            if status_chart:
+                grid.addWidget(status_chart, 1, 0)
+
+            asset_data = [(a['label'], a['total']) for a in stats["assets_by_kind"]]
+            assets_chart = make_bar_chart(asset_data, "Assets by Type")
+            if assets_chart:
+                grid.addWidget(assets_chart, 1, 1)
+
+        except ImportError:
+            # Fallback to text boxes if matplotlib is not installed
+            grid.addWidget(self._stat_box(
+                "By status", [f"{name}: {n}" for name, n in stats["by_status"]]), 0, 0)
+            grid.addWidget(self._stat_box(
+                "By region", [f"{name}: {n}" for name, n in stats["by_region"]]), 0, 1)
+            grid.addWidget(self._stat_box(
+                "Top departments", [f"{name}: {n}" for name, n in stats["by_department"]]), 1, 0)
+
+        # Always show summary boxes
         grid.addWidget(self._stat_box("Asset registers", [
             f"{a['label']}: {a['total']} on file, {a['issued']} currently issued"
             for a in stats["assets_by_kind"]
         ]), 2, 0)
-        grid.addWidget(self._stat_box("Records missing basic contact info", [
+        grid.addWidget(self._stat_box("Records missing contact info", [
             f"No email address: {stats['missing_email']}",
             f"No contact number: {stats['missing_contact']}",
         ]), 2, 1)
         self.dashboard_layout.insertLayout(1, grid)
+
+        # --- Data Integrity Cross-Check ---
+        integrity_title = QLabel("<b>Data Integrity - Serial Number Cross-Check</b>")
+        integrity_title.setStyleSheet("margin-top: 12px;")
+        self.dashboard_layout.addWidget(integrity_title)
+
+        issues = self.store.cross_check_serials()
+        total_issues = sum(len(v) for v in issues.values())
+
+        if total_issues == 0:
+            ok_label = QLabel("No mismatches found. All serial numbers are consistent.")
+            ok_label.setStyleSheet("color: #006a63; font-weight: bold; padding: 8px;")
+            self.dashboard_layout.addWidget(ok_label)
+        else:
+            warn_label = QLabel(
+                f"Found {total_issues} mismatch(es) between employee records and asset registers:")
+            warn_label.setStyleSheet("color: #d7282f; font-weight: bold; padding: 4px;")
+            self.dashboard_layout.addWidget(warn_label)
+
+            integrity_grid = QGridLayout()
+            col = 0
+            labels = {
+                "laptop": "Laptop Serial Mismatches",
+                "mobile": "Mobile Serial Mismatches",
+                "printer": "Printer Serial Mismatches",
+                "unassigned_laptop": "Laptops with Missing Assignment",
+            }
+            row_pos = 0
+            for key, items in issues.items():
+                if items:
+                    box = self._stat_box(labels[key], items[:20])
+                    integrity_grid.addWidget(box, row_pos // 2, row_pos % 2)
+                    row_pos += 1
+            self.dashboard_layout.addLayout(integrity_grid)
+
         self.dashboard_layout.addStretch()
 
     # -- my account ------------------------------------------------------
@@ -1705,7 +2071,27 @@ def run(store: Store):
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setStyleSheet(STYLE)
+
+    # Set up a global exception handler so crashes are logged to file
+    def _handle_exception(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        _log.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+    sys.excepthook = _handle_exception
+
+    _log.info("Application starting")
+    # Apply saved theme preference on startup
+    saved_theme = QSettings("ITRecords", "IT Records").value("theme", "light")
+    try:
+        import qdarktheme
+        if saved_theme == "dark":
+            app.setStyleSheet(qdarktheme.load_stylesheet("dark"))
+        else:
+            app.setStyleSheet(STYLE)
+    except (ImportError, Exception):
+        app.setStyleSheet(STYLE)
+
     app.setFont(QFont("Segoe UI", 10))
     icon = _app_icon()
     if icon:
@@ -1725,6 +2111,7 @@ def main() -> int:
         return 1
 
     first = store.bootstrap()
+    store.backup()
     if first:
         user, password = first
         QMessageBox.information(
@@ -1735,7 +2122,9 @@ def main() -> int:
             "My Account once real users are on the system.")
 
     run(store)
-    return app.exec_()
+    rc = app.exec_()
+    _log.info("Application exiting (code %d)", rc)
+    return rc
 
 
 if __name__ == "__main__":

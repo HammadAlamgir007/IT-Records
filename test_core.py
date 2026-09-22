@@ -335,7 +335,7 @@ def test_import(folder):
 
     rows, ignored, problems = read_excel(path)
     expect(len(rows) == 4, "four usable rows: two employees, the no-id row, and the duplicate")
-    expect("Sno" in ignored and "Cost Centre" in ignored, "unknown headings are reported")
+    expect("Cost Centre" in ignored, "unknown headings are reported")
     expect(any("no Employee ID" in p for p in problems),
            "a row without an ID is called out, even though it is still imported")
     expect(any("also on row" in p for p in problems), "a repeated ID is reported")
@@ -614,7 +614,7 @@ def test_exports(store, folder):
     from openpyxl import load_workbook
     sheet = load_workbook(xlsx).active
     expect(sheet.max_row == len(rows) + 1, "one header row plus one row per employee")
-    expect(sheet.cell(1, 2).value == "Employee ID", "the header uses the screen labels")
+    expect(sheet.cell(1, 3).value == "Employee ID", "the header uses the screen labels")
     expect(sheet.max_column == len(COLUMNS) + 1, "Sno plus every field")
 
     pdf = export_pdf(rows, folder / "employees.pdf", subtitle="Self-test")
@@ -688,6 +688,11 @@ def main():
         test_exports(store, folder)
         test_import(folder)
         test_bundle_seed(folder)
+        
+        # Shutdown logging so log files in the temp directory can be deleted on Windows
+        import logging
+        logging.shutdown()
+        
     print("self-check OK")
 
 
