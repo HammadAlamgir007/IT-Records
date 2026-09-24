@@ -60,8 +60,9 @@ def check_viewer(store, app):
     expect(window.role == "superadmin", "a successful sign-in upgrades the session")
     names = buttons(window)
     for shown in ("Add Employee", "Edit", "Delete", "Import Excel", "Export Excel",
-                  "Export CSV", "Export PDF"):
+                  "Export PDF"):
         expect(shown in names, f"after the upgrade the super admin sees '{shown}'")
+    expect("Export CSV" not in names, "CSV export is gone")
     tabs = [b.text() for b in window.tabs]
     expect("Activity Log" in tabs and "Users" in tabs,
            "the admin tabs appear after the upgrade")
@@ -261,15 +262,12 @@ def check_import_preview(window, folder):
 
 
 def check_exports(store, folder):
-    from core import export_csv, export_excel, export_pdf
+    from core import export_excel, export_pdf
     rows = store.employees()
     xlsx = export_excel(rows, folder / "gui.xlsx")
-    csv_file = export_csv(rows, folder / "gui.csv")
     pdf = export_pdf(rows, folder / "gui.pdf", subtitle="GUI test")
     expect(xlsx.stat().st_size > 0 and pdf.read_bytes().startswith(b"%PDF"),
            "both exports produce real files")
-    expect(csv_file.stat().st_size > 0 and "Employee ID" in csv_file.read_text(encoding="utf-8-sig"),
-           "the CSV export produces a real file with the right headers")
 
     # asset registers export with their own columns and labels
     import core

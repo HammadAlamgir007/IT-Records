@@ -669,13 +669,6 @@ def test_exports(store, folder):
     blank_cell = values[COLUMNS.index("designation")]       # left blank in this row
     expect(blank_cell in (None, ""), "a blank field stays blank, not a stray quote mark")
 
-    # A CSV carries the same columns as the sheet.
-    import csv as _csv
-    csv_path = core.export_csv(rows, folder / "employees.csv")
-    with open(csv_path, encoding="utf-8-sig", newline="") as fh:
-        head = next(_csv.reader(fh))
-    expect(len(head) == len(COLUMNS), "the CSV has no duplicate counter column either")
-
     # The employee sheet has 30-odd fields and most are blank; printing them all
     # squeezed every value into a sliver a letter wide, so the PDF drops the
     # columns nothing fills.
@@ -706,8 +699,8 @@ def test_fixed_password(folder: Path):
 
 
 def test_sno(folder: Path):
-    """Every employee shows a serial number, including rows written before the
-    column existed and rows imported from a sheet that has no Sno of its own."""
+    """SNO is a gap-free 1, 2, 3 ... sequence the app owns: new and imported
+    rows join the end, a delete closes the gap, and the register lists in it."""
     path = folder / "sno.db"
     store = Store(path)
     store.bootstrap()
@@ -715,14 +708,28 @@ def test_sno(folder: Path):
     store.add_employee(blank | {"emp_id": "S-1", "sno": "7"}, "system", "superadmin")
     store.add_employee(blank | {"emp_id": "S-2"}, "system", "superadmin")
     by_id = {r["emp_id"]: r for r in store.employees()}
-    expect(by_id["S-1"]["sno"] == "7", "a number typed in is kept")
-    expect(by_id["S-2"]["sno"] == "8", "and the next one carries on from it")
+    expect(by_id["S-1"]["sno"] == "1", "numbering starts at 1 whatever was typed")
+    expect(by_id["S-2"]["sno"] == "2", "and a new employee joins the end")
 
-    # An import with no Sno column, the way most of the department's sheets are.
-    store.bulk_import([{"emp_id": "S-3", "emp_name": "Imported", "_row": 2}],
+    # An import (its own Sno column is ignored for new rows - they join the end).
+    store.bulk_import([{"emp_id": "S-3", "emp_name": "Imported", "sno": "1", "_row": 2}],
                       actor="system", role="superadmin")
-    expect({r["emp_id"]: r for r in store.employees()}["S-3"]["sno"] == "9",
-           "an imported row is numbered too")
+    expect({r["emp_id"]: r for r in store.employees()}["S-3"]["sno"] == "3",
+           "an imported row is numbered on the end too")
+
+    # Editing never moves a row.
+    s1 = {r["emp_id"]: r for r in store.employees()}["S-1"]
+    store.update_employee(s1["id"], s1 | {"sno": "99", "emp_name": "Renamed"},
+                          "system", "superadmin")
+    expect({r["emp_id"]: r for r in store.employees()}["S-1"]["sno"] == "1",
+           "an edit keeps the row's place")
+
+    # A delete closes the gap it leaves.
+    s2 = {r["emp_id"]: r for r in store.employees()}["S-2"]
+    store.delete_employee(s2["id"], "system", "superadmin")
+    listed = store.employees()
+    expect([r["sno"] for r in listed] == ["1", "2"], "after a delete the numbers stay 1..N")
+    expect([r["emp_id"] for r in listed] == ["S-1", "S-3"], "and the register lists in SNO order")
 
     # An old database: the column was added by a migration, so every row was left
     # blank. Opening the file fills them in.

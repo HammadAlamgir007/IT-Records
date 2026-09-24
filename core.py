@@ -11,6 +11,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import secrets
 import sqlite3
 import sys
@@ -290,6 +291,31 @@ COMPANY_FIELDS = ("name", "address", "city", "phone", "email")
 COMPANY_DEFAULTS = {k: "" for k in COMPANY_FIELDS}
 
 
+def _relevance(row: dict, search: str, words: list[str],
+               id_fields=("emp_id", "sno", "user_id"), name_fields=("emp_name",)) -> int:
+    """Sort key for a search hit - lower is a better match. Ties keep their
+    register order, since Python's sort is stable."""
+    q = search.strip().lower()
+    ids = [str(row.get(f) or "").strip().lower() for f in id_fields]
+    names = [str(row.get(f) or "").strip().lower() for f in name_fields]
+    name_words = [w for n in names for w in re.split(r"[\s.\-_]+", n) if w]
+    if q in ids:
+        return 0                                   # exact Emp ID / SNO / User ID
+    if q in names:
+        return 1                                   # exact full name
+    if all(w.lower() in name_words for w in words):
+        return 2                                   # whole name words ('Ali', not 'Alisha')
+    if all(any(nw.startswith(w.lower()) for nw in name_words) for w in words):
+        return 3                                   # every word starts a name word
+    if any(i.startswith(q) for i in ids):
+        return 4
+    if any(q in n for n in names):
+        return 5                                   # buried inside a name ('Muhammad')
+    if any(q in i for i in ids):
+        return 6
+    return 7                                       # matched some other field
+
+
 def default_db_path() -> Path:
     """%ITRECORDS_DB% if set, else ITRecords\\employees.db in the user's profile."""
     env = os.environ.get("ITRECORDS_DB")
@@ -477,7 +503,10 @@ class Store:
                 if col not in existing_cols:
                     c.execute(f"ALTER TABLE employees ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
-        self._backfill_sno()
+        with self._conn() as c:
+            fixed = self._renumber_sno(c)
+        if fixed:
+            _log.info("Renumbered %d serial number(s) into sequence", fixed)
 
         # Serials that already sit on employee records are brought into the asset
         # registers with that employee as the current owner, so the tabs are not
@@ -551,15 +580,30 @@ class Store:
     # ------------------------------------------------------------ employees
 
     def employees(self, search: str = "") -> list[dict]:
-        """Newest first. A search matches a substring of any field."""
+        """In SNO order (1, 2, 3 ...), or best match first when searching.
+
+        Every word of the search must appear in some field ('hammad laptop'
+        finds Hammad's laptop row). Results are ranked so the person being
+        looked for comes first: an exact ID beats a name that starts with the
+        word, which beats the word buried inside another name ('Muhammad')."""
         sql = "SELECT * FROM employees"
         args: list[str] = []
-        if search.strip():
-            sql += " WHERE " + " OR ".join(f"{c} LIKE ?" for c in COLUMNS)
-            args = [f"%{search.strip()}%"] * len(COLUMNS)
-        sql += " ORDER BY id DESC"
+        words = search.split()
+        if words:
+            any_field = "(" + " OR ".join(f"{c} LIKE ?" for c in COLUMNS) + ")"
+            sql += " WHERE " + " AND ".join([any_field] * len(words))
+            for word in words:
+                args += [f"%{word}%"] * len(COLUMNS)
+        sql += " ORDER BY CAST(sno AS INTEGER), id"
         with self._conn() as c:
-            return [dict(r) for r in c.execute(sql, args)]
+            rows = [dict(r) for r in c.execute(sql, args)]
+        if words:
+            rows.sort(key=lambda r: _relevance(r, search, words))
+        return rows
+
+    def employee_count(self) -> int:
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) FROM employees").fetchone()[0]
 
     def employee(self, row_id: int) -> dict | None:
         with self._conn() as c:
@@ -598,28 +642,22 @@ class Store:
                             f"{who} ({held['current_emp_id']}) - release or reassign it first")
         return None
 
-    def _backfill_sno(self) -> None:
-        """Give every employee a serial number.
+    @staticmethod
+    def _renumber_sno(c) -> int:
+        """Keep SNO a gap-free 1, 2, 3 ... sequence.
 
-        `sno` was added after the first databases were in use, so an ALTER TABLE
-        left every existing row with an empty one - and an imported sheet without
-        a Sno column does the same. Rows that already carry a number keep it (it
-        is the number the department's own sheet uses); the blanks are filled in
-        record order, continuing past the highest number already taken.
+        The app owns this number: rows keep their relative order (by the number
+        they already carry, then by when they were added), blanks go last, and a
+        delete closes the gap it leaves. Returns how many rows were renumbered.
         """
-        with self._conn() as c:
-            blanks = [r["id"] for r in c.execute(
-                "SELECT id FROM employees WHERE TRIM(sno)='' ORDER BY id")]
-            if not blanks:
-                return
-            taken = {str(r["sno"]).strip() for r in c.execute(
-                "SELECT sno FROM employees WHERE TRIM(sno)<>''")}
-            nums = {int(t) for t in taken if t.isdigit()}
-            nxt = max(nums, default=0) + 1
-            for row_id in blanks:
-                c.execute("UPDATE employees SET sno=? WHERE id=?", (str(nxt), row_id))
-                nxt += 1
-        _log.info("Filled in %d missing serial number(s)", len(blanks))
+        rows = c.execute("SELECT id, sno FROM employees "
+                         "ORDER BY TRIM(sno)='', CAST(sno AS INTEGER), id").fetchall()
+        changed = 0
+        for n, row in enumerate(rows, start=1):
+            if str(row["sno"]).strip() != str(n):
+                c.execute("UPDATE employees SET sno=? WHERE id=?", (str(n), row["id"]))
+                changed += 1
+        return changed
 
     def _next_sno(self, c) -> str:
         highest = c.execute("SELECT MAX(CAST(sno AS INTEGER)) FROM employees").fetchone()[0]
@@ -633,8 +671,7 @@ class Store:
             raise Invalid(conflict)
         stamp = now()
         with self._conn() as c:
-            if not data.get("sno"):
-                data["sno"] = self._next_sno(c)
+            data["sno"] = self._next_sno(c)          # a new employee joins the end
             cols = list(data) + ["created", "updated", "created_by", "updated_by"]
             values = list(data.values()) + [stamp, stamp, actor, actor]
             try:
@@ -645,6 +682,7 @@ class Store:
             except sqlite3.IntegrityError as exc:
                 raise Invalid(f"Employee ID {data['emp_id']} already exists") from exc
             row_id = cur.lastrowid
+            self._renumber_sno(c)
         self.log(actor, "add", "employee", data["emp_id"], self._describe(data))
         _log.info("Employee added: %s by %s", data["emp_id"], actor)
         return row_id
@@ -655,6 +693,7 @@ class Store:
         if not before:
             raise Invalid("That employee record no longer exists")
         data = self._clean(data)
+        data["sno"] = before["sno"]                  # the app owns the sequence
         conflict = self._duplicate_asset(data, exclude_id=row_id)
         if conflict:
             raise Invalid(conflict)
@@ -682,10 +721,30 @@ class Store:
             raise Invalid("That employee record no longer exists")
         with self._conn() as c:
             c.execute("DELETE FROM employees WHERE id=?", (row_id,))
+            self._renumber_sno(c)                    # close the gap it leaves
         # The record is gone; the fact that it existed and who removed it is not.
         self.log(actor, "delete", "employee", row["emp_id"],
                  self._describe({k: row[k] for k in COLUMNS}))
         _log.info("Employee deleted: %s by %s", row["emp_id"], actor)
+
+    def delete_employees(self, row_ids: list[int], actor: str, role: str) -> int:
+        """Delete many employees in one transaction - all of them or none.
+        Each deletion is still recorded in the Activity Log. Returns the count."""
+        self._require(role, "delete")
+        stamp = now()
+        with self._conn() as c:
+            marks = ",".join("?" * len(row_ids))
+            rows = [dict(r) for r in c.execute(
+                f"SELECT * FROM employees WHERE id IN ({marks})", list(row_ids))]
+            c.execute(f"DELETE FROM employees WHERE id IN ({marks})", list(row_ids))
+            c.executemany(
+                "INSERT INTO audit (at, actor, action, entity, entity_id, detail) "
+                "VALUES (?,?,?,?,?,?)",
+                [(stamp, actor, "delete", "employee", r["emp_id"],
+                  self._describe({k: r[k] for k in COLUMNS})) for r in rows])
+            self._renumber_sno(c)
+        _log.info("%d employee(s) deleted by %s", len(rows), actor)
+        return len(rows)
 
     # -------------------------------------------------------------- assets
 
@@ -721,12 +780,17 @@ class Store:
         cols = list(ASSET_COLUMNS) + ["current_emp_name", "current_emp_id"]
         sql = "SELECT * FROM assets WHERE kind=?"
         args: list = [kind]
-        if search.strip():
+        words = search.split()
+        for word in words:                        # every word must match somewhere
             sql += " AND (" + " OR ".join(f"{c} LIKE ?" for c in cols) + ")"
-            args += [f"%{search.strip()}%"] * len(cols)
+            args += [f"%{word}%"] * len(cols)
         sql += " ORDER BY id DESC"
         with self._conn() as c:
-            return [dict(r) for r in c.execute(sql, args)]
+            rows = [dict(r) for r in c.execute(sql, args)]
+        if words:
+            rows.sort(key=lambda r: _relevance(r, search, words, id_fields=(
+                "identity", "serial", "imei", "mac_no"), name_fields=("current_emp_name",)))
+        return rows
 
     def asset(self, asset_id: int) -> dict | None:
         with self._conn() as c:
@@ -1190,9 +1254,8 @@ class Store:
                 try:
                     if current is None:
                         data = self._clean(record)
-                        if not data.get("sno"):
-                            data["sno"] = next_sno
-                            next_sno = str(int(next_sno) + 1)
+                        data["sno"] = next_sno           # imported rows join the end
+                        next_sno = str(int(next_sno) + 1)
                         cols = list(data) + ["created", "updated", "created_by", "updated_by"]
                         values = list(data.values()) + [stamp, stamp, actor, actor]
                         try:
@@ -1222,6 +1285,7 @@ class Store:
                                 "Skipped - fix the ID or the name and import again.")
                             continue
                         merged = {k: (record.get(k) or current[k]) for k in COLUMNS}
+                        merged["sno"] = current["sno"]
                         sets = ", ".join(f"{k}=?" for k in merged) + ", updated=?, updated_by=?"
                         c.execute(f"UPDATE employees SET {sets} WHERE id=?",
                                   list(merged.values()) + [stamp, actor, current["id"]])
@@ -1246,6 +1310,7 @@ class Store:
                 c.execute(
                     "INSERT INTO audit (at, actor, action, entity, entity_id, detail) "
                     "VALUES (?,?,?,?,?,?)", (stamp, *entry))
+            self._renumber_sno(c)
         return result
 
     def reset_registers(self, actor: str = "", role: str = "",
@@ -1872,23 +1937,6 @@ def read_excel(path: Path | str) -> tuple[list[dict], list[str], list[str]]:
                 f"Row {record['_row']}: Employee ID {record['emp_id']} also on row {first}")
         seen.setdefault(record["emp_id"], record["_row"])
     return rows, ignored, problems
-
-
-def export_csv(rows: list[dict], path: Path | str, columns: list[str] | None = None,
-               labels: dict[str, str] | None = None) -> Path:
-    """A plain CSV - useful for tools other than Excel (a mail merge, another database)."""
-    import csv
-
-    columns = columns or COLUMNS
-    labels = labels or LABELS
-    numbered = "sno" not in columns
-    path = Path(path)
-    with open(path, "w", newline="", encoding="utf-8-sig") as fh:
-        writer = csv.writer(fh)
-        writer.writerow((["Sno"] if numbered else []) + [labels.get(c, c) for c in columns])
-        for n, row in enumerate(rows, start=1):
-            writer.writerow(([n] if numbered else []) + [row.get(c, "") for c in columns])
-    return path
 
 
 def _cell(value):

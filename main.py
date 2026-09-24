@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import logging
 import smtplib
@@ -10,58 +11,283 @@ from pathlib import Path
 
 _log = logging.getLogger("itrecords.ui")
 
-from PyQt5.QtCore import Qt, QSettings, QTimer, QDate
-from PyQt5.QtGui import QFont, QIcon, QKeySequence
-from PyQt5.QtWidgets import (QAbstractItemView, QAction, QApplication, QComboBox, QDateEdit,
-                             QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout,
-                             QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
-                             QMainWindow, QMessageBox, QPushButton, QScrollArea,
-                             QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit,
-                             QVBoxLayout, QWidget)
+from PyQt5.QtCore import (Qt, QAbstractAnimation, QDate, QEasingCurve, QEvent, QObject,
+                          QPropertyAnimation, QSettings, QTimer)
+from PyQt5.QtGui import QColor, QCursor, QFont, QIcon, QKeySequence
+from PyQt5.QtWidgets import (QAbstractItemView, QAction, QApplication, QCalendarWidget,
+                             QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog,
+                             QFormLayout, QFrame, QGraphicsOpacityEffect, QGridLayout,
+                             QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
+                             QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
+                             QScrollArea, QSplitter, QStackedWidget, QStyle,
+                             QStyledItemDelegate, QTableWidget, QTableWidgetItem,
+                             QTextBrowser, QTextEdit, QVBoxLayout, QWidget, QWidgetAction)
 
 import core
-from core import (ASSET_LABELS, ASSET_META, CHOICES, COLUMNS, COMPANY_DEFAULTS, FIELDS, GROUPS,
-                  LABELS, ROLES, Store, Denied, Invalid, export_csv, export_excel, export_pdf,
-                  export_record_pdf, local_time, read_excel)
+from core import (ASSET_LABELS, ASSET_META, CHOICES, COLUMNS, FIELDS, GROUPS, LABELS, ROLES,
+                  Store, Denied, Invalid, export_excel, export_pdf, export_record_pdf,
+                  local_time, read_excel)
 
-BRAND = "#006a63"
-BRAND_DARK = "#004f49"
-YELLOW = "#ffd100"
-RED = "#d7282f"
+# ------------------------------------------------------------------ theme
 
-STYLE = f"""
-QWidget {{ font-family: "Segoe UI"; font-size: 10pt; color: #14211f; }}
-QMainWindow, QDialog, #page {{ background: #f5f7f7; }}
-#header {{ background: #ffffff; border-bottom: 3px solid {BRAND}; }}
-#brand {{ color: {BRAND}; font-size: 16pt; font-weight: 800; }}
-#brandDot {{ color: {YELLOW}; font-size: 16pt; font-weight: 800; }}
-#subtitle, #who {{ color: #5f7472; }}
-#banner {{ background: #fff8d6; border-left: 4px solid {YELLOW}; padding: 8px; color: #6b5900; }}
-QPushButton {{ background: {BRAND}; color: #fff; border: 1px solid {BRAND};
-               border-radius: 5px; padding: 6px 14px; font-weight: 600; }}
-QPushButton:hover {{ background: {BRAND_DARK}; border-color: {BRAND_DARK}; }}
-QPushButton:disabled {{ background: #b9c6c4; border-color: #b9c6c4; }}
-QPushButton#ghost {{ background: #fff; color: {BRAND}; }}
-QPushButton#ghost:hover {{ background: #e6f1f0; }}
-QPushButton#danger {{ background: {RED}; border-color: {RED}; }}
-QPushButton#tab {{ background: transparent; color: #5f7472; border: none;
-                   border-bottom: 3px solid transparent; border-radius: 0; padding: 8px 9px; }}
-QPushButton#tab:checked {{ color: {BRAND_DARK}; border-bottom: 3px solid {YELLOW}; }}
-QLineEdit, QComboBox {{ background: #fff; border: 1px solid #d9e2e1; border-radius: 5px; padding: 6px; }}
-QLineEdit:focus, QComboBox:focus {{ border: 1px solid {BRAND}; }}
-QTableWidget {{ background: #fff; border: 1px solid #d9e2e1; border-radius: 6px;
-                gridline-color: #e6eceb; }}
-QTableWidget::item:selected {{ background: #e6f1f0; color: #14211f; }}
-QHeaderView::section {{ background: {BRAND}; color: #fff; font-weight: 600;
-                        padding: 6px; border: none; border-bottom: 3px solid {YELLOW}; }}
-QGroupBox {{ border: 1px solid #d9e2e1; border-radius: 6px; margin-top: 14px;
-             background: #fff; padding-top: 8px; }}
+LIGHT = {
+    "bg": "#f3f6f5", "surface": "#ffffff", "border": "#dbe4e2", "text": "#14211f",
+    "muted": "#5f7472", "brand": "#006a63", "brand_dark": "#004f49", "brand_soft": "#e2f1ee",
+    "accent": "#ffd100", "danger": "#d7282f", "danger_dark": "#b01d23", "alt_row": "#f7faf9",
+    "hover_row": "#eaf5f3",
+    "sidebar": "#0b3b37", "side_text": "#b9d3cf", "side_hover": "#13504a",
+    "banner_bg": "#fff8d6", "banner_text": "#6b5900", "disabled": "#b9c6c4",
+}
+DARK = {
+    "bg": "#101716", "surface": "#18211f", "border": "#2a3735", "text": "#e3ecea",
+    "muted": "#8fa39f", "brand": "#1a9488", "brand_dark": "#137a70", "brand_soft": "#1b3431",
+    "accent": "#ffd100", "danger": "#e0474d", "danger_dark": "#c2353b", "alt_row": "#1c2624",
+    "hover_row": "#223330",
+    "sidebar": "#0a100f", "side_text": "#93aaa6", "side_hover": "#16211f",
+    "banner_bg": "#3a3312", "banner_text": "#f1dc8a", "disabled": "#3a4846",
+}
+PALETTE = dict(LIGHT)       # the palette in use - the dashboard charts read it too
+
+
+def build_style(p: dict) -> str:
+    return f"""
+QWidget {{ font-family: "Segoe UI"; font-size: 10pt; color: {p['text']}; }}
+QMainWindow, QDialog, #page {{ background: {p['bg']}; }}
+QToolTip {{ background: {p['surface']}; color: {p['text']}; border: 1px solid {p['border']}; }}
+
+#sidebar {{ background: {p['sidebar']}; }}
+#sidebar QLabel {{ color: {p['side_text']}; background: transparent; }}
+#sidebar #brand {{ color: #ffffff; font-size: 17pt; font-weight: 800; }}
+#sidebar #brandDot {{ color: {p['accent']}; font-size: 17pt; font-weight: 800; }}
+#brand {{ color: {p['brand']}; font-size: 16pt; font-weight: 800; }}
+#brandDot {{ color: {p['accent']}; font-size: 16pt; font-weight: 800; }}
+#navScroll, #navScroll > QWidget, #navScroll > QWidget > QWidget {{ background: transparent; }}
+#navSection {{ font-size: 8pt; font-weight: 700; padding: 12px 10px 3px 10px; }}
+QPushButton#nav {{ background: transparent; color: {p['side_text']}; border: none;
+                   border-left: 3px solid transparent; border-radius: 0; text-align: left;
+                   padding: 6px 12px; font-weight: 600; }}
+QPushButton#nav:hover {{ background: {p['side_hover']}; color: #ffffff; }}
+QPushButton#nav:checked {{ background: {p['side_hover']}; color: #ffffff;
+                           border-left: 3px solid {p['accent']}; }}
+#userCard {{ background: {p['side_hover']}; border-radius: 8px; }}
+#sidebar #userName {{ color: #ffffff; font-weight: 700; }}
+QPushButton#side {{ background: transparent; color: #ffffff; border: 1px solid {p['side_text']};
+                    border-radius: 6px; padding: 6px 10px; font-weight: 600; }}
+QPushButton#side:hover {{ background: {p['brand']}; border-color: {p['brand']}; }}
+
+#pageTitle {{ font-size: 17pt; font-weight: 700; }}
+#subtitle, #who {{ color: {p['muted']}; }}
+#banner {{ background: {p['banner_bg']}; border-left: 4px solid {p['accent']}; padding: 8px 10px;
+           color: {p['banner_text']}; }}
+
+QPushButton {{ background: {p['brand']}; color: #ffffff; border: 1px solid {p['brand']};
+               border-radius: 6px; padding: 6px 14px; font-weight: 600; }}
+QPushButton:hover {{ background: {p['brand_dark']}; border-color: {p['brand_dark']}; }}
+QPushButton:disabled {{ background: {p['disabled']}; border-color: {p['disabled']}; color: {p['surface']}; }}
+QPushButton#ghost {{ background: {p['surface']}; color: {p['brand']}; border-color: {p['border']}; }}
+QPushButton#ghost:hover {{ background: {p['brand_soft']}; border-color: {p['brand']}; }}
+QPushButton#ghost:disabled {{ background: {p['surface']}; color: {p['disabled']}; border-color: {p['border']}; }}
+QPushButton:pressed {{ background: {p['brand_dark']}; padding-top: 7px; padding-bottom: 5px; }}
+QPushButton#ghost:pressed {{ background: {p['brand_soft']}; }}
+QPushButton#danger {{ background: {p['danger']}; color: #ffffff; border-color: {p['danger']}; }}
+QPushButton#danger:hover {{ background: {p['danger_dark']}; border-color: {p['danger_dark']}; }}
+QPushButton#danger:pressed {{ background: {p['danger_dark']}; }}
+QPushButton#danger:disabled {{ background: {p['surface']}; color: {p['disabled']}; border-color: {p['border']}; }}
+QPushButton#menuDanger {{ background: transparent; color: {p['danger']}; border: none; border-radius: 4px;
+                          text-align: left; padding: 6px 22px; font-weight: 600; }}
+QPushButton#menuDanger:hover {{ background: {p['danger']}; color: #ffffff; }}
+QPushButton#more {{ background: {p['surface']}; color: {p['text']}; border-color: {p['border']};
+                    padding-right: 24px; }}
+QPushButton#more:hover {{ background: {p['brand_soft']}; }}
+QPushButton#more::menu-indicator {{ subcontrol-position: right center; right: 8px; }}
+#divider {{ background: {p['border']}; }}
+
+QMenu {{ background: {p['surface']}; border: 1px solid {p['border']}; padding: 4px; }}
+QMenu::item {{ padding: 6px 22px; border-radius: 4px; }}
+QMenu::item:selected {{ background: {p['brand_soft']}; color: {p['text']}; }}
+QMenu::item:disabled {{ color: {p['disabled']}; }}
+QMenu::separator {{ height: 1px; background: {p['border']}; margin: 4px 6px; }}
+
+QLineEdit, QComboBox, QDateEdit, QTextEdit {{ background: {p['surface']}; border: 1px solid {p['border']};
+                                              border-radius: 6px; padding: 6px 8px; }}
+QLineEdit:hover, QComboBox:hover, QDateEdit:hover, QTextEdit:hover {{ border: 1px solid {p['muted']}; }}
+QLineEdit:focus, QComboBox:focus, QDateEdit:focus, QTextEdit:focus {{ border: 1px solid {p['brand']}; }}
+QTextBrowser {{ background: {p['surface']}; border: 1px solid {p['border']}; border-radius: 6px; padding: 8px; }}
+QDateEdit::drop-down {{ width: 26px; border: none; }}
+QCalendarWidget QWidget#qt_calendar_navigationbar {{ background: {p['brand']}; }}
+QCalendarWidget QToolButton {{ color: #ffffff; background: transparent; font-weight: 700;
+                               padding: 4px 8px; border-radius: 4px; }}
+QCalendarWidget QToolButton:hover {{ background: {p['brand_dark']}; }}
+QCalendarWidget QMenu {{ background: {p['surface']}; }}
+QCalendarWidget QSpinBox {{ background: {p['surface']}; color: {p['text']}; }}
+QCalendarWidget QAbstractItemView {{ background: {p['surface']}; color: {p['text']};
+                                     selection-background-color: {p['brand']}; selection-color: #ffffff;
+                                     outline: 0; }}
+QCalendarWidget QAbstractItemView:disabled {{ color: {p['disabled']}; }}
+QSplitter::handle {{ background: transparent; width: 10px; }}
+QLineEdit:read-only {{ background: {p['bg']}; color: {p['muted']}; }}
+QComboBox QAbstractItemView {{ background: {p['surface']}; selection-background-color: {p['brand_soft']};
+                               selection-color: {p['text']}; }}
+
+QTableWidget {{ background: {p['surface']}; alternate-background-color: {p['alt_row']};
+                border: 1px solid {p['border']}; border-radius: 8px; gridline-color: {p['border']};
+                selection-background-color: {p['brand_soft']}; selection-color: {p['text']}; }}
+QTableWidget::item {{ padding: 4px 6px; }}
+QHeaderView {{ background: {p['surface']}; }}
+QHeaderView::section {{ background: {p['surface']}; color: {p['muted']}; font-weight: 700;
+                        padding: 7px 6px; border: none; border-bottom: 2px solid {p['brand']};
+                        border-right: 1px solid {p['border']}; }}
+QTableCornerButton::section {{ background: {p['surface']}; border: none; }}
+QScrollArea {{ background: transparent; border: none; }}
+QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; }}
+QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 0; }}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{ background: {p['border']};
+                                                             border-radius: 5px; min-height: 30px; min-width: 30px; }}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {{ background: {p['muted']}; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: none; }}
+
+QGroupBox {{ border: 1px solid {p['border']}; border-radius: 8px; margin-top: 14px;
+             background: {p['surface']}; padding-top: 10px; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 5px;
-                    color: {BRAND_DARK}; font-weight: 700; }}
-QLabel#error {{ color: {RED}; }}
-QLabel#count {{ background: #e6f1f0; color: {BRAND_DARK}; border-radius: 9px;
-                padding: 3px 10px; font-weight: 600; }}
+                    color: {p['brand']}; font-weight: 700; }}
+#tile {{ background: {p['surface']}; border: 1px solid {p['border']}; border-radius: 8px; }}
+#tile:hover {{ border: 1px solid {p['brand']}; background: {p['alt_row']}; }}
+#tileValue {{ font-size: 20pt; font-weight: 700; color: {p['brand']}; }}
+#tileLabel {{ color: {p['muted']}; font-weight: 600; }}
+QLabel#error {{ color: {p['danger']}; }}
+QLabel#ok {{ color: {p['brand']}; font-weight: 700; }}
+QLabel#count {{ background: {p['brand_soft']}; color: {p['brand']}; border-radius: 10px;
+                padding: 4px 12px; font-weight: 700; }}
+QStatusBar {{ background: {p['surface']}; color: {p['muted']}; border-top: 1px solid {p['border']}; }}
 """
+
+
+STYLE = build_style(LIGHT)
+
+
+def apply_theme(name: str) -> None:
+    """Switch the whole app between the light and dark palettes."""
+    PALETTE.clear()
+    PALETTE.update(DARK if name == "dark" else LIGHT)
+    app = QApplication.instance()
+    if app is not None:
+        app.setStyleSheet(build_style(PALETTE))
+
+
+class SortItem(QTableWidgetItem):
+    """A cell that sorts the way people read: 2 before 10, and 'b' next to 'B'."""
+
+    def __lt__(self, other):
+        a, b = self.text().strip(), other.text().strip()
+        if a.isdigit() and b.isdigit():
+            return int(a) < int(b)
+        if a.isdigit() != b.isdigit():
+            return a.isdigit()              # numbers ahead of text
+        return a.lower() < b.lower()
+
+
+def divider() -> QFrame:
+    line = QFrame()
+    line.setObjectName("divider")
+    line.setFixedSize(1, 24)
+    return line
+
+
+def page_title(box: QVBoxLayout, title: str, subtitle: str = "", right: QWidget | None = None):
+    """The heading every page opens with."""
+    row = QHBoxLayout()
+    text = QVBoxLayout()
+    text.setSpacing(0)
+    heading = QLabel(title)
+    heading.setObjectName("pageTitle")
+    text.addWidget(heading)
+    if subtitle:
+        sub = QLabel(subtitle)
+        sub.setObjectName("subtitle")
+        text.addWidget(sub)
+    row.addLayout(text)
+    row.addStretch()
+    if right is not None:
+        row.addWidget(right, 0, Qt.AlignBottom)
+    box.addLayout(row)
+
+
+def search_box(placeholder: str) -> QLineEdit:
+    box = QLineEdit(placeholderText=placeholder)
+    box.setClearButtonEnabled(True)
+    box.setMinimumWidth(320)
+    return box
+
+
+def make_table(multi: bool = True) -> QTableWidget:
+    table = QTableWidget()
+    table.setSelectionBehavior(QAbstractItemView.SelectRows)
+    table.setSelectionMode(QAbstractItemView.ExtendedSelection if multi
+                           else QAbstractItemView.SingleSelection)
+    table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+    table.setAlternatingRowColors(True)
+    table.setShowGrid(False)
+    table.verticalHeader().setVisible(False)
+    table.verticalHeader().setDefaultSectionSize(32)
+    table.horizontalHeader().setHighlightSections(False)
+    RowHover(table)
+    return table
+
+
+# ------------------------------------------------------------------ email
+#
+# The sender account for "Send Email". Kept in QSettings (per Windows user) and
+# editable from Email Settings. A fresh PC starts from EMAIL_DEFAULTS plus an
+# optional email.json beside the database - the app password lives there (or in
+# Email Settings), never in the source.
+
+EMAIL_DEFAULTS = {
+    "smtp_server": "smtp.gmail.com",      # bipl.io mail is hosted on Google Workspace
+    "smtp_port": "587",
+    "smtp_email": "kawish.iftikhar@bipl.io",
+    "smtp_password": "",
+}
+_RETIRED_SENDERS = {"hammadalamgir778@gmail.com"}
+
+
+def _email_file_defaults() -> dict:
+    """email.json next to the database (or next to the exe), if one exists."""
+    import json
+    folders = [core.default_db_path().parent, Path(sys.executable).parent, Path(__file__).parent]
+    for folder in folders:
+        path = folder / "email.json"
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            return {k: str(data[k]) for k in EMAIL_DEFAULTS if data.get(k)}
+    return {}
+
+
+def email_config() -> dict:
+    """The saved sender settings. A PC with nothing saved yet, or still on the
+    old built-in sender, is moved onto the current defaults."""
+    settings = QSettings("ITRecords", "Settings")
+    saved = str(settings.value("smtp_email", "") or "").strip().lower()
+    if not saved or saved in _RETIRED_SENDERS or not settings.value("smtp_password", ""):
+        for key, value in (EMAIL_DEFAULTS | _email_file_defaults()).items():
+            settings.setValue(key, value)
+    return {key: str(settings.value(key, default) or "")
+            for key, default in EMAIL_DEFAULTS.items()}
+
+
+def _smtp(config: dict) -> smtplib.SMTP:
+    """A signed-in SMTP connection (STARTTLS on 587, SSL on 465)."""
+    port = int(config["smtp_port"])
+    if port == 465:
+        server = smtplib.SMTP_SSL(config["smtp_server"], port, timeout=20)
+    else:
+        server = smtplib.SMTP(config["smtp_server"], port, timeout=20)
+        server.starttls()
+    server.login(config["smtp_email"], config["smtp_password"].replace(" ", ""))
+    return server
 
 
 def brand_mark(subtitle: str = "") -> QWidget:
@@ -134,7 +360,154 @@ class LoginDialog(QDialog):
         self.accept()
 
 
+# ----------------------------------------------------------- window helpers
+
+def fit_to_screen(window: QWidget, width: float, height: float):
+    """Size a window to a share of the screen it opens on, and centre it."""
+    screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+    area = screen.availableGeometry()
+    window.resize(int(area.width() * width), int(area.height() * height))
+    frame = window.frameGeometry()
+    frame.moveCenter(area.center())
+    window.move(frame.topLeft())
+
+
+def confirm_danger(parent, title: str, text: str, action: str = "Delete") -> bool:
+    """A red, cancel-by-default confirmation for anything that destroys data."""
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Warning)
+    box.setWindowTitle(title)
+    box.setText(f"<b>{title}</b>")
+    box.setInformativeText(text)
+    go = box.addButton(action, QMessageBox.DestructiveRole)
+    go.setObjectName("danger")
+    cancel = box.addButton(QMessageBox.Cancel)
+    cancel.setObjectName("ghost")
+    for button in (go, cancel):                  # re-style now the names are set
+        button.style().unpolish(button)
+        button.style().polish(button)
+    box.setDefaultButton(cancel)
+    box.exec_()
+    return box.clickedButton() is go
+
+
+class FadeIn(QObject):
+    """App-wide: every window and dialog fades in instead of popping up."""
+
+    def eventFilter(self, obj, event):
+        if (event.type() == QEvent.Show and obj.isWidgetType() and obj.isWindow()
+                and isinstance(obj, (QDialog, QMainWindow))):
+            obj.setWindowOpacity(0.0)
+            anim = QPropertyAnimation(obj, b"windowOpacity", obj)
+            anim.setDuration(170)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            anim.start(QAbstractAnimation.DeleteWhenStopped)
+        return False
+
+
+class RowHover(QStyledItemDelegate):
+    """Tints the whole row under the mouse, so it is clear which record a
+    double-click will open."""
+
+    def __init__(self, table: QTableWidget):
+        super().__init__(table)
+        self.table = table
+        self.row = -1
+        table.setMouseTracking(True)
+        table.setItemDelegate(self)
+        table.entered.connect(self._enter)
+        table.viewport().installEventFilter(self)
+
+    def _enter(self, index):
+        if index.row() != self.row:
+            self.row = index.row()
+            self.table.viewport().update()
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Leave and self.row != -1:
+            self.row = -1
+            self.table.viewport().update()
+        return False
+
+    def paint(self, painter, option, index):
+        if index.row() == self.row and not (option.state & QStyle.State_Selected):
+            painter.fillRect(option.rect, QColor(PALETTE["hover_row"]))
+        super().paint(painter, option, index)
+
+
 # ------------------------------------------------------------ employee form
+
+class DatePopup(QDateEdit):
+    """A date box that may be blank ('Not set'). Opening the calendar on a
+    blank date shows this month, not the year 1900 that stands for blank."""
+
+    BLANK = QDate(1900, 1, 1)
+
+    def __init__(self):
+        super().__init__()
+        self.setCalendarPopup(True)
+        self.setDisplayFormat("dd MMM yyyy")
+        self.setMinimumDate(self.BLANK)
+        self.setSpecialValueText("Not set")
+        self.setDate(self.BLANK)
+        cal = self.calendarWidget()
+        cal.setGridVisible(False)
+        cal.setFirstDayOfWeek(Qt.Monday)
+        cal.setVerticalHeaderFormat(QCalendarWidget.NoVerticalHeader)
+        cal.setHorizontalHeaderFormat(QCalendarWidget.ShortDayNames)
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        if self.date() == self.BLANK:
+            today = QDate.currentDate()
+            QTimer.singleShot(0, lambda: self.calendarWidget().setCurrentPage(
+                today.year(), today.month()))
+
+
+class DateField(QWidget):
+    """Date of joining: a calendar, plus Today and Clear. The value is stored
+    as yyyy-MM-dd; a value in some other layout is read if it can be, and kept
+    untouched if it cannot - opening a record must never change it."""
+
+    FORMATS = ("yyyy-MM-dd", "dd/MM/yyyy", "d/M/yyyy", "dd-MM-yyyy", "d-M-yyyy",
+               "dd.MM.yyyy", "dd MMM yyyy", "d MMM yyyy", "dd-MMM-yyyy", "d-MMM-yy",
+               "MMM d, yyyy", "yyyy/MM/dd")
+
+    def __init__(self, value: str = ""):
+        super().__init__()
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        self.edit = DatePopup()
+        row.addWidget(self.edit, 1)
+        for text, slot in (("Today", lambda: self.edit.setDate(QDate.currentDate())),
+                           ("Clear", lambda: self.edit.setDate(DatePopup.BLANK))):
+            b = QPushButton(text)
+            b.setObjectName("ghost")
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(slot)
+            row.addWidget(b)
+        self._raw = ""
+        value = (value or "").strip()
+        if value:
+            parsed = next((d for d in (QDate.fromString(value, f) for f in self.FORMATS)
+                           if d.isValid()), None)
+            if parsed:
+                self.edit.setDate(parsed)
+            else:
+                self._raw = value
+                self.edit.setToolTip(f"Saved as '{value}' - not a date the calendar can "
+                                     "read. It is kept unless you pick a new date.")
+        self.edit.dateChanged.connect(lambda _: setattr(self, "_raw", ""))
+
+    def text(self) -> str:
+        if self._raw:
+            return self._raw
+        d = self.edit.date()
+        return "" if d == DatePopup.BLANK else d.toString("yyyy-MM-dd")
+
 
 class EmployeeDialog(QDialog):
     """Add or edit one employee. Every field of the entity is on this one form."""
@@ -142,49 +515,46 @@ class EmployeeDialog(QDialog):
     def __init__(self, parent, record: dict | None = None):
         super().__init__(parent)
         self.setWindowTitle("Edit employee" if record else "Add employee")
-        # Use WindowMaximized flag so exec_() opens it maximized on Windows
-        self.setWindowFlags(self.windowFlags() | Qt.Window)
-        self.setWindowState(Qt.WindowMaximized)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint)
+        fit_to_screen(self, 0.8, 0.85)
         self.inputs: dict[str, QWidget] = {}
+        labels = dict((f[0], f[1]) for f in FIELDS)
 
         outer = QVBoxLayout(self)
+        outer.setContentsMargins(20, 16, 20, 14)
+        who = (f"{record.get('emp_name') or record.get('emp_id')}  ·  SNO {record.get('sno')}"
+               if record else "A new employee joins the end of the register")
+        page_title(outer, "Edit employee" if record else "Add employee", who)
+
         scroll = QScrollArea(widgetResizable=True, frameShape=QScrollArea.NoFrame)
         holder = QWidget()
         holder.setObjectName("page")
         body = QVBoxLayout(holder)
+        body.setContentsMargins(0, 0, 8, 0)
 
         for group_name, keys in GROUPS:
             group = QGroupBox(group_name)
             grid = QGridLayout(group)
+            grid.setHorizontalSpacing(14)
+            grid.setVerticalSpacing(8)
             for index, key in enumerate(keys):
                 row, column = divmod(index, 2)
+                value = str(record.get(key, "")) if record else ""
                 if key == "sno":
-                    widget = QLineEdit(str(record.get(key, "")) if record else "")
+                    widget = QLineEdit(value)
                     widget.setReadOnly(True)
-                    widget.setPlaceholderText("Auto-generated")
+                    widget.setPlaceholderText("Given automatically")
                 elif key == "join_date":
-                    widget = QDateEdit()
-                    widget.setCalendarPopup(True)
-                    widget.setDisplayFormat("yyyy-MM-dd")
-                    if record and record.get(key):
-                        try:
-                            parts = record[key].split("-")
-                            if len(parts) == 3:
-                                widget.setDate(QDate(int(parts[0]), int(parts[1]), int(parts[2])))
-                        except Exception:
-                            widget.setDate(QDate.currentDate())
-                    else:
-                        widget.setDate(QDate.currentDate())
+                    widget = DateField(value)
                 elif key in CHOICES:
                     widget = QComboBox()
                     widget.addItems(CHOICES[key])
-                    if record and record.get(key):
-                        widget.setCurrentText(record[key])
+                    if value:
+                        widget.setCurrentText(value)
                 else:
-                    widget = QLineEdit(str(record.get(key, "")) if record else "")
+                    widget = QLineEdit(value)
                 self.inputs[key] = widget
-                label = QLabel(dict(((f[0], f[1]) for f in FIELDS))[key])
-                grid.addWidget(label, row, column * 2)
+                grid.addWidget(QLabel(labels[key]), row, column * 2)
                 grid.addWidget(widget, row, column * 2 + 1)
             grid.setColumnStretch(1, 1)
             grid.setColumnStretch(3, 1)
@@ -194,32 +564,30 @@ class EmployeeDialog(QDialog):
                       "and filled in later. A serial number that an asset is already issued "
                       "under will be refused.")
         note.setObjectName("subtitle")
+        note.setWordWrap(True)
         body.addWidget(note)
         body.addStretch()
         scroll.setWidget(holder)
-        outer.addWidget(scroll)
+        outer.addWidget(scroll, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Cancel).setObjectName("ghost")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)
+        self.inputs["emp_id"].setFocus()
 
     def values(self) -> dict:
         result = {}
         for key, w in self.inputs.items():
-            if isinstance(w, QComboBox):
-                result[key] = w.currentText()
-            elif isinstance(w, QDateEdit):
-                result[key] = w.date().toString("yyyy-MM-dd")
-            else:
-                result[key] = w.text()
+            result[key] = w.currentText() if isinstance(w, QComboBox) else w.text()
         return result
 
     def accept(self):
         """Validate before closing."""
         emp_id_widget = self.inputs.get("emp_id")
         if emp_id_widget and not emp_id_widget.text().strip():
-            emp_id_widget.setStyleSheet("border: 2px solid #d7282f;")
+            emp_id_widget.setStyleSheet(f"border: 2px solid {PALETTE['danger']};")
             emp_id_widget.setPlaceholderText("Employee ID is required!")
             warn(self, "Employee ID cannot be empty. Please enter a valid Employee ID.")
             emp_id_widget.setFocus()
@@ -255,87 +623,386 @@ class EmailConfigDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
         self.setWindowTitle("Email Settings")
-        self.setMinimumWidth(380)
+        self.setMinimumWidth(440)
         form = QFormLayout(self)
-        
-        self.settings = QSettings("ITRecords", "Settings")
-        
-        self.server = QLineEdit(self.settings.value("smtp_server", "smtp.gmail.com"))
-        self.port = QLineEdit(self.settings.value("smtp_port", "587"))
-        self.email = QLineEdit(self.settings.value("smtp_email", "hammadalamgir778@gmail.com"))
-        self.password = QLineEdit(self.settings.value("smtp_password", "qxab wjpx xvje orma"))
-        self.password.setEchoMode(QLineEdit.Password)
-        
-        form.addRow("SMTP Server:", self.server)
-        form.addRow("SMTP Port:", self.port)
-        form.addRow("Sender Email:", self.email)
-        form.addRow("App Password:", self.password)
-        
+        config = email_config()
+        self.server = QLineEdit(config["smtp_server"])
+        self.port = QLineEdit(config["smtp_port"])
+        self.email = QLineEdit(config["smtp_email"])
+        self.password = QLineEdit(config["smtp_password"], echoMode=QLineEdit.Password)
+        form.addRow("SMTP Server", self.server)
+        form.addRow("SMTP Port", self.port)
+        form.addRow("Sender Email", self.email)
+        form.addRow("App Password", self.password)
+        hint = QLabel("For Google Workspace / Gmail use smtp.gmail.com, port 587 and an "
+                      "app password (Google Account → Security → App passwords).")
+        hint.setObjectName("subtitle")
+        hint.setWordWrap(True)
+        form.addRow(hint)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        test = buttons.addButton("Test connection", QDialogButtonBox.ActionRole)
+        test.setObjectName("ghost")
+        test.clicked.connect(self.test)
         buttons.accepted.connect(self.save)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
 
+    def values(self) -> dict:
+        return {"smtp_server": self.server.text().strip(), "smtp_port": self.port.text().strip(),
+                "smtp_email": self.email.text().strip(), "smtp_password": self.password.text()}
+
+    def test(self):
+        """Sign in to the mail server without sending anything."""
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            with _smtp(self.values()):
+                pass
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Email Settings", f"Could not sign in:\n{exc}")
+            return
+        QApplication.restoreOverrideCursor()
+        QMessageBox.information(self, "Email Settings", "Signed in to the mail server - "
+                                "these settings work.")
+
     def save(self):
-        self.settings.setValue("smtp_server", self.server.text())
-        self.settings.setValue("smtp_port", self.port.text())
-        self.settings.setValue("smtp_email", self.email.text())
-        self.settings.setValue("smtp_password", self.password.text())
+        values = self.values()
+        if not all(values.values()) or not values["smtp_port"].isdigit():
+            warn(self, "Fill in every field (the port is a number, usually 587).")
+            return
+        settings = QSettings("ITRecords", "Settings")
+        for key, value in values.items():
+            settings.setValue(key, value)
         self.accept()
 
-class ComposeEmailDialog(QDialog):
-    def __init__(self, parent, to_email):
-        super().__init__(parent)
-        self.setWindowTitle(f"Compose Email to {to_email}")
-        self.resize(500, 400)
-        self.to_email = to_email
-        
-        box = QVBoxLayout(self)
-        
-        form = QFormLayout()
-        self.subject = QLineEdit()
-        form.addRow("Subject:", self.subject)
-        box.addLayout(form)
-        
-        from PyQt5.QtWidgets import QTextEdit as _QTE  # noqa: F401 — use module-level import
-        self.body = QTextEdit()
-        box.addWidget(self.body)
 
+# Email templates. {placeholders} are filled in for each employee; a line whose
+# placeholders are all blank for that person is left out, and so is a block
+# (e.g. 'Equipment issued to you') that ends up with nothing in it.
+
+MAIL_FIELDS = [
+    ("name", "Full name"), ("first_name", "First name"), ("emp_id", "Employee ID"),
+    ("sno", "Serial no (SNO)"), ("designation", "Designation"), ("department", "Department"),
+    ("join_date", "Date of joining"), ("user_id", "User ID"), ("email", "Email"),
+    ("contact_no", "Contact no"), ("location", "Location"), ("region", "Region"),
+    ("laptop", "Laptop"), ("mobile", "Mobile"), ("ip_phone", "IP phone"),
+    ("sim_number", "SIM number"), ("company", "Company"), ("today", "Today's date"),
+]
+
+_DETAILS = """    Employee ID      : {emp_id}
+    Serial No (SNO)  : {sno}
+    Designation      : {designation}
+    Department       : {department}
+    Date of joining  : {join_date}
+    User ID          : {user_id}
+    Official email   : {email}
+    Location         : {location}"""
+
+_EQUIPMENT = """Equipment issued to you:
+    Laptop           : {laptop}
+    Mobile           : {mobile}
+    SIM number       : {sim_number}
+    IP phone         : {ip_phone}"""
+
+_SIGN_OFF = """Best regards,
+IT Department
+{company_sig}"""
+
+EMAIL_TEMPLATES = {
+    "Welcome new employee": (
+        "Welcome to {company}, {first_name}!",
+        "Dear {name},\n\n"
+        "Welcome to {company}! We are glad to have you with us and wish you every success "
+        "in your new role.\n\n"
+        "The IT department has set up your records. Please keep this email for reference:\n\n"
+        + _DETAILS + "\n\n" + _EQUIPMENT + "\n\n"
+        "If any of these details are wrong, or you need help with your equipment or "
+        "accounts, simply reply to this email.\n\n" + _SIGN_OFF),
+    "Your IT records & equipment": (
+        "Your IT records - {name} ({emp_id})",
+        "Dear {name},\n\n"
+        "Here is a summary of the details the IT department holds for you:\n\n"
+        + _DETAILS + "\n\n" + _EQUIPMENT + "\n\n"
+        "Please reply to this email if anything needs correcting.\n\n" + _SIGN_OFF),
+    "Custom message": (
+        "",
+        "Dear {name},\n\n\n\n" + _SIGN_OFF),
+}
+
+_PLACEHOLDER = re.compile(r"\{(\w+)\}")
+
+
+def mail_fields(record: dict | None, company: str, address: str = "") -> dict:
+    """The values an email template can use, for one employee."""
+    r = record or {}
+
+    def pair(name, serial):
+        name, serial = (r.get(name) or "").strip(), (r.get(serial) or "").strip()
+        return f"{name} (S/N {serial})" if name and serial else name or serial
+
+    name = (r.get("emp_name") or "").strip()
+    join = (r.get("join_date") or "").strip()
+    parsed = QDate.fromString(join, "yyyy-MM-dd")
+    return {
+        "name": name or "Colleague",
+        "first_name": name.split()[0] if name else "Colleague",
+        "emp_id": r.get("emp_id", ""), "sno": r.get("sno", ""),
+        "designation": r.get("designation", ""), "department": r.get("department", ""),
+        "join_date": parsed.toString("dd MMMM yyyy") if parsed.isValid() else join,
+        "user_id": r.get("user_id", ""), "email": r.get("email", "") or address,
+        "contact_no": r.get("contact_no", ""), "location": r.get("location", ""),
+        "region": r.get("region", ""),
+        "laptop": pair("laptop_name_type", "laptop_serial"),
+        "mobile": pair("mobile_name_type", "mobile_serial"),
+        "ip_phone": r.get("ip_phone", ""), "sim_number": r.get("sim_number", ""),
+        "company": company or "the team",
+        "company_sig": company,
+        "today": QDate.currentDate().toString("dd MMMM yyyy"),
+    }
+
+
+def render_mail(text: str, fields: dict) -> str:
+    """Fill a template for one person, dropping lines and blocks left empty."""
+    out_blocks = []
+    for block in text.split("\n\n"):
+        lines, had_fields, kept_fields = [], False, False
+        for line in block.split("\n"):
+            keys = _PLACEHOLDER.findall(line)
+            known = [k for k in keys if k in fields]
+            if known:
+                had_fields = True
+                if not any(str(fields[k]).strip() for k in known):
+                    continue                              # nothing to say on this line
+                kept_fields = True
+            lines.append(_PLACEHOLDER.sub(
+                lambda m: str(fields.get(m.group(1), m.group(0))), line))
+        if had_fields and not kept_fields and len(lines) <= 1:
+            continue                                      # a heading with nothing under it
+        out_blocks.append("\n".join(lines))
+    return "\n\n".join(out_blocks).strip() + "\n"
+
+
+def mail_html(text: str) -> str:
+    """The same message as tidy HTML: 'Label : value' lines become a table."""
+    from html import escape
+    row = re.compile(r"^\s{2,}(.+?)\s*:\s(.*)$")
+    parts = []
+    for block in text.strip().split("\n\n"):
+        lines = block.split("\n")
+        rows = [row.match(l) for l in lines]
+        if rows and all(rows[1:]) and (len(lines) > 1 or rows[0]):
+            head = "" if rows[0] else f"<p style='margin:0 0 6px 0'><b>{escape(lines[0])}</b></p>"
+            cells = [m for m in rows if m]
+            table = "".join(
+                f"<tr><td style='padding:5px 14px 5px 0;color:#5f7472;white-space:nowrap'>"
+                f"{escape(m.group(1))}</td><td style='padding:5px 0'><b>{escape(m.group(2))}</b>"
+                f"</td></tr>" for m in cells)
+            parts.append(f"{head}<table style='border-collapse:collapse;border-left:3px solid "
+                         f"#006a63;padding-left:12px;margin:0 0 16px 4px'>{table}</table>")
+        else:
+            parts.append("<p style='margin:0 0 14px 0'>" +
+                         "<br>".join(escape(l) for l in lines) + "</p>")
+    return ("<div style='font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#14211f;"
+            "line-height:1.5'>" + "".join(parts) + "</div>")
+
+
+class ComposeEmailDialog(QDialog):
+    """Send a template or a custom message to one or more employees. Everyone
+    gets their own copy, filled in with their own details."""
+
+    def __init__(self, parent, records: list[dict], company: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Send Email")
+        fit_to_screen(self, 0.72, 0.8)
+        self.records = records
+        self.company = company
+        self.by_address = {(r.get("email") or "").strip().lower(): r for r in records}
+        self.sent: list[str] = []
+        config = email_config()
+
+        box = QVBoxLayout(self)
+        box.setContentsMargins(20, 16, 20, 14)
+        box.setSpacing(10)
+        page_title(box, "Send Email", f"From {config['smtp_email']}")
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(14)
+        self.template = QComboBox()
+        self.template.addItems(list(EMAIL_TEMPLATES))
+        self.template.currentTextChanged.connect(self.use_template)
+        form.addRow("Template", self.template)
+        self.to = QLineEdit(", ".join(r["email"].strip() for r in records))
+        self.to.setPlaceholderText("name@company.com, another@company.com")
+        self.to.textChanged.connect(self._fill_preview_choices)
+        form.addRow("To", self.to)
+        self.subject = QLineEdit()
+        self.subject.textChanged.connect(self.update_preview)
+        form.addRow("Subject", self.subject)
+        box.addLayout(form)
+
+        split = QSplitter(Qt.Horizontal)
+        left = QWidget()
+        lcol = QVBoxLayout(left)
+        lcol.setContentsMargins(0, 0, 0, 0)
+        lhead = QHBoxLayout()
+        lhead.addWidget(QLabel("<b>Message</b>"))
+        lhead.addStretch()
+        insert = QPushButton("Insert field")
+        insert.setObjectName("more")
+        menu = QMenu(insert)
+        for key, label in MAIL_FIELDS:
+            menu.addAction(label, lambda k=key: self.body.insertPlainText("{" + k + "}"))
+        insert.setMenu(menu)
+        lhead.addWidget(insert)
+        lcol.addLayout(lhead)
+        self.body = QTextEdit()
+        self.body.setAcceptRichText(False)
+        self.body.setFont(QFont("Consolas", 10))
+        self.body.textChanged.connect(self.update_preview)
+        lcol.addWidget(self.body, 1)
+        hint = QLabel("Fields in {braces} are filled in for each person. A line whose "
+                      "fields are empty for someone is left out of their copy.")
+        hint.setObjectName("subtitle")
+        hint.setWordWrap(True)
+        lcol.addWidget(hint)
+        split.addWidget(left)
+
+        right = QWidget()
+        rcol = QVBoxLayout(right)
+        rcol.setContentsMargins(0, 0, 0, 0)
+        rhead = QHBoxLayout()
+        rhead.addWidget(QLabel("<b>Preview for</b>"))
+        self.preview_for = QComboBox()
+        self.preview_for.currentIndexChanged.connect(self.update_preview)
+        rhead.addWidget(self.preview_for, 1)
+        rcol.addLayout(rhead)
+        self.preview_subject = QLabel()
+        self.preview_subject.setWordWrap(True)
+        rcol.addWidget(self.preview_subject)
+        self.preview = QTextBrowser()
+        rcol.addWidget(self.preview, 1)
+        split.addWidget(right)
+        split.setSizes([1, 1])
+        box.addWidget(split, 1)
+
+        self.progress = QLabel()
+        self.progress.setObjectName("subtitle")
+        box.addWidget(self.progress)
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.button(QDialogButtonBox.Ok).setText("Send")
+        self.send_button = btns.button(QDialogButtonBox.Ok)
+        btns.button(QDialogButtonBox.Cancel).setObjectName("ghost")
         btns.accepted.connect(self.send)
         btns.rejected.connect(self.reject)
         box.addWidget(btns)
 
-    def send(self):
-        settings = QSettings("ITRecords", "Settings")
-        server = settings.value("smtp_server", "smtp.gmail.com")
-        port = settings.value("smtp_port", "587")
-        email_addr = settings.value("smtp_email", "hammadalamgir778@gmail.com")
-        password = settings.value("smtp_password", "qxab wjpx xvje orma")
-        
-        if not all([server, port, email_addr, password]):
-            QMessageBox.warning(self, "Missing Settings", "Please configure Email Settings first.")
+        self._fill_preview_choices()
+        self.use_template(self.template.currentText())
+
+    # -- recipients and preview -------------------------------------------
+
+    def recipients(self) -> list[str]:
+        parts = self.to.text().replace(";", ",").split(",")
+        seen, out = set(), []
+        for p in (p.strip() for p in parts):
+            if p and p.lower() not in seen:
+                seen.add(p.lower())
+                out.append(p)
+        return out
+
+    def _fields_for(self, address: str) -> dict:
+        return mail_fields(self.by_address.get(address.lower()), self.company, address)
+
+    def _fill_preview_choices(self):
+        current = self.preview_for.currentData()
+        self.preview_for.blockSignals(True)
+        self.preview_for.clear()
+        for address in self.recipients():
+            r = self.by_address.get(address.lower())
+            self.preview_for.addItem(f"{r['emp_name'] or r['emp_id']}  <{address}>" if r
+                                     else address, address)
+        index = self.preview_for.findData(current)
+        self.preview_for.setCurrentIndex(max(index, 0))
+        self.preview_for.blockSignals(False)
+        self.send_button.setText(f"Send to {len(self.recipients())}")
+        self.update_preview()
+
+    def use_template(self, name: str):
+        subject, body = EMAIL_TEMPLATES[name]
+        self.subject.setText(subject)
+        self.body.setPlainText(body)
+        if name == "Custom message":
+            self.subject.setFocus()
+
+    def update_preview(self):
+        address = self.preview_for.currentData()
+        if not address:
+            self.preview.setHtml("<p style='color:gray'>Add a recipient to see the preview.</p>")
+            self.preview_subject.setText("")
             return
+        fields = self._fields_for(address)
+        subject = render_mail(self.subject.text(), fields).strip()
+        self.preview_subject.setText(f"<b>Subject:</b> {subject or '(no subject)'}")
+        self.preview.setHtml(mail_html(render_mail(self.body.toPlainText(), fields)))
 
+    # -- sending ------------------------------------------------------------
+
+    def send(self):
+        to = self.recipients()
+        bad = [a for a in to if not re.fullmatch(r"[^@\s,]+@[^@\s,]+\.[^@\s,]+", a)]
+        if not to or bad:
+            warn(self, "Enter at least one valid email address." if not to
+                 else "These addresses do not look right:\n" + "\n".join(bad))
+            return
+        if not self.subject.text().strip():
+            warn(self, "Give the email a subject.")
+            self.subject.setFocus()
+            return
+        config = email_config()
+        if not config["smtp_password"]:
+            warn(self, "No app password is set for the sender.\n\n"
+                 "Open More → Email Settings and enter it first.")
+            return
+        failed: list[str] = []
+        self.send_button.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            msg = EmailMessage()
-            msg['Subject'] = self.subject.text()
-            msg['From'] = email_addr
-            msg['To'] = self.to_email
-            msg.set_content(self.body.toPlainText())
+            with _smtp(config) as server:
+                for n, address in enumerate(to, start=1):
+                    self.progress.setText(f"Sending {n} of {len(to)} - {address} ...")
+                    QApplication.processEvents()
+                    fields = self._fields_for(address)
+                    text = render_mail(self.body.toPlainText(), fields)
+                    msg = EmailMessage()
+                    msg["Subject"] = render_mail(self.subject.text(), fields).strip()
+                    msg["From"] = config["smtp_email"]
+                    msg["To"] = address
+                    msg.set_content(text)
+                    msg.add_alternative(mail_html(text), subtype="html")
+                    try:
+                        server.send_message(msg)
+                        self.sent.append(address)
+                    except smtplib.SMTPException as exc:
+                        failed.append(f"{address}: {exc}")
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            self.send_button.setEnabled(True)
+            self.progress.setText("")
+            _log.error("Email send failed: %s", exc)
+            QMessageBox.critical(self, "Send Email", f"Could not send:\n{exc}\n\n"
+                                 "Check More → Email Settings (Test connection).")
+            return
+        QApplication.restoreOverrideCursor()
+        self.send_button.setEnabled(True)
+        _log.info("Email '%s' sent to %d recipient(s)", self.template.currentText(), len(self.sent))
+        if failed:
+            QMessageBox.warning(self, "Send Email", f"Sent {len(self.sent)} of {len(to)}.\n\n"
+                                "Not sent:\n" + "\n".join(failed))
+        else:
+            QMessageBox.information(self, "Send Email", f"Email sent to {len(self.sent)} "
+                                    f"recipient{'' if len(self.sent) == 1 else 's'}.")
+        self.accept()
 
-            with smtplib.SMTP(server, int(port)) as s:
-                s.starttls()
-                s.login(email_addr, password)
-                s.send_message(msg)
-            
-            _log.info("Email sent to %s subject='%s'", self.to_email, self.subject.text())
-            QMessageBox.information(self, "Success", "Email sent successfully!")
-            self.accept()
-        except Exception as e:
-            _log.error("Email send failed to %s: %s", self.to_email, e)
-            QMessageBox.critical(self, "Error", f"Failed to send email:\n{str(e)}")
 
 class NewUserDialog(QDialog):
     def __init__(self, parent):
@@ -434,7 +1101,7 @@ class AssetDialog(QDialog):
         self.kind = kind
         meta = ASSET_META[kind]
         self.setWindowTitle(f"{'Edit' if record else 'Add'} {meta['label']}")
-        self.resize(620, 640)
+        fit_to_screen(self, 0.55, 0.7)
         self.inputs: dict[str, QWidget] = {}
 
         outer = QVBoxLayout(self)
@@ -637,16 +1304,20 @@ class MainWindow(QMainWindow):
         self.rows: list[dict] = []
         self.asset_rows: dict[str, list[dict]] = {k: [] for k in ASSET_META}
         self.asset_export_buttons: dict[str, list] = {k: [] for k in ASSET_META}
+        self.search = None
+        # SNO 1, 2, 3 ... on every start; a header click re-sorts for the session.
+        self.emp_sort = (0, Qt.AscendingOrder)
 
         self.setWindowTitle("IT Records")
         self.settings = QSettings("ITRecords", "IT Records")
         geometry = self.settings.value("geometry")
-        self.restoreGeometry(geometry) if geometry else self.resize(1380, 780)
+        self.restoreGeometry(geometry) if geometry else self.resize(1440, 820)
+        self.setMinimumSize(1100, 640)
 
         page = QWidget()
         page.setObjectName("page")
         self.setCentralWidget(page)
-        outer = QVBoxLayout(page)
+        outer = QHBoxLayout(page)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         self.header_widget = self._header()
@@ -665,19 +1336,20 @@ class MainWindow(QMainWindow):
         self.refresh()
         for kind in ASSET_META:
             self.refresh_assets(kind)
+        self.show_page(0)
 
     def closeEvent(self, event):
         self.settings.setValue("geometry", self.saveGeometry())
         super().closeEvent(event)
 
     def _shortcuts(self):
+        """Keys act on the page in front: Ctrl+N adds a laptop on the Laptops
+        page and an employee on the Employees page."""
         keys = [
-            ("Ctrl+F", lambda: (self.show_page(0),
-                                (self.search if self.stack.currentIndex() == 0
-                                 else self.search).setFocus(), self.search.selectAll())),
-            ("F5", self.refresh),
-            ("Ctrl+N", self.add_employee),
-            ("Ctrl+E", self.edit_employee),
+            ("Ctrl+F", self._focus_search),
+            ("F5", self._refresh_current),
+            ("Ctrl+N", lambda: self._on_page(self.add_employee, self.add_asset)),
+            ("Ctrl+E", lambda: self._on_page(self.edit_employee, self.edit_asset)),
             ("Delete", self._delete_current),
             ("Ctrl+Q", self.close),
         ]
@@ -686,6 +1358,30 @@ class MainWindow(QMainWindow):
             action.setShortcut(QKeySequence(key))
             action.triggered.connect(slot)
             self.addAction(action)
+
+    def _on_page(self, employee_slot, asset_slot):
+        index = self.stack.currentIndex()
+        if index == 0:
+            employee_slot()
+        elif index in INDEX_KIND:
+            asset_slot(INDEX_KIND[index])
+
+    def _focus_search(self):
+        index = self.stack.currentIndex()
+        box = (self.asset_search[INDEX_KIND[index]] if index in INDEX_KIND
+               else self.log_search if index == 6 else None)
+        if box is None:
+            self.show_page(0)
+            box = self.search
+        box.setFocus()
+        box.selectAll()
+
+    def _refresh_current(self):
+        index = self.stack.currentIndex()
+        if index == 0:
+            self.refresh()
+        self.show_page(index)          # reloads whatever that page shows
+        self.status.showMessage("Refreshed.", 2000)
 
     def _delete_current(self):
         index = self.stack.currentIndex()
@@ -773,84 +1469,116 @@ class MainWindow(QMainWindow):
 
     # -- chrome ----------------------------------------------------------
 
+    NAV = [("REGISTERS", [("Employees", 0), ("Laptops", 1), ("Mobiles", 2), ("IP Phones", 3),
+                          ("Printers", 4), ("Challan", 5)]),
+           ("OVERVIEW", [("Dashboard", 9), ("Activity Log", 6)]),
+           ("ACCOUNT", [("Users", 7), ("My Account", 8)])]
+
+    def _may_see(self, index: int) -> bool:
+        if index == 6:
+            return Store.may(self.role, "logs")
+        if index == 7:
+            return Store.may(self.role, "users")
+        return True
+
     def _header(self) -> QWidget:
+        """The navigation sidebar: brand, grouped pages, who is signed in."""
         bar = QWidget()
-        bar.setObjectName("header")
-        row = QHBoxLayout(bar)
-        row.setContentsMargins(16, 8, 16, 0)
-        row.addWidget(brand_mark("Register"))
+        bar.setObjectName("sidebar")
+        bar.setAttribute(Qt.WA_StyledBackground, True)
+        bar.setFixedWidth(220)
+        col = QVBoxLayout(bar)
+        col.setContentsMargins(12, 16, 12, 12)
+        col.setSpacing(6)
+        brand = brand_mark()
+        brand.layout().setContentsMargins(10, 0, 0, 0)
+        col.addWidget(brand)
 
+        # The page list scrolls on a short screen rather than squeezing the
+        # account card below it.
+        holder = QWidget()
+        nav = QVBoxLayout(holder)
+        nav.setContentsMargins(0, 0, 0, 0)
+        nav.setSpacing(1)
         self.tabs: list[QPushButton] = []
-        names = [("Employees", 0), ("Laptops", 1), ("Mobiles", 2), ("IP Phones", 3),
-                 ("Printers", 4), ("Challan", 5), ("Activity Log", 6), ("Users", 7),
-                 ("My Account", 8), ("Dashboard", 9)]
-        for text, index in names:
-            if index == 6 and not Store.may(self.role, "logs"):
+        for section, items in self.NAV:
+            shown = [(text, index) for text, index in items if self._may_see(index)]
+            if not shown:
                 continue
-            if index == 7 and not Store.may(self.role, "users"):
-                continue
-            button = QPushButton(text)
-            button.setObjectName("tab")
-            button.setCheckable(True)
-            button.clicked.connect(lambda _, i=index: self.show_page(i))
-            row.addWidget(button)
-            self.tabs.append(button)
+            heading = QLabel(section)
+            heading.setObjectName("navSection")
+            nav.addWidget(heading)
+            for text, index in shown:
+                button = QPushButton(text)
+                button.setObjectName("nav")
+                button.setCheckable(True)
+                button.setCursor(Qt.PointingHandCursor)
+                button.clicked.connect(lambda _, i=index: self.show_page(i))
+                nav.addWidget(button)
+                self.tabs.append(button)
+        nav.addStretch()
+        scroll = QScrollArea(widgetResizable=True, frameShape=QScrollArea.NoFrame)
+        scroll.setObjectName("navScroll")
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(holder)
+        col.addWidget(scroll, 1)
 
-        row.addStretch()
-        if self.role == "viewer":
-            who = QLabel("Read-only view")
-            who.setObjectName("who")
-            row.addWidget(who)
-            sign = QPushButton("Sign in")
-            sign.setObjectName("ghost")
-            sign.clicked.connect(self.sign_in)
-            row.addWidget(sign)
-        else:
-            who = QLabel(f"{self.username}  ·  {ROLES[self.role].split(' - ')[0]}")
-            who.setObjectName("who")
-            row.addWidget(who)
-            sign = QPushButton("Sign out")
-            sign.setObjectName("ghost")
-            sign.clicked.connect(self.sign_out)
-            row.addWidget(sign)
-
-        # Theme toggle button — always visible in header
+        card = QWidget()
+        card.setObjectName("userCard")
+        card.setAttribute(Qt.WA_StyledBackground, True)
+        inner = QVBoxLayout(card)
+        inner.setContentsMargins(12, 10, 12, 12)
+        inner.setSpacing(4)
+        viewer = self.role == "viewer"
+        name = QLabel("Not signed in" if viewer else self.username)
+        name.setObjectName("userName")
+        who = QLabel("Read-only view" if viewer else ROLES[self.role].split(" - ")[0])
+        who.setObjectName("who")
+        sign = QPushButton("Sign in" if viewer else "Sign out")
+        sign.setObjectName("side")
+        sign.setCursor(Qt.PointingHandCursor)
+        sign.clicked.connect(self.sign_in if viewer else self.sign_out)
         self.theme_btn = QPushButton()
-        self.theme_btn.setObjectName("ghost")
-        self.theme_btn.setToolTip("Toggle Dark / Light mode")
+        self.theme_btn.setObjectName("side")
+        self.theme_btn.setCursor(Qt.PointingHandCursor)
+        self.theme_btn.setToolTip("Switch between light and dark mode")
         self._update_theme_btn_icon()
         self.theme_btn.clicked.connect(self.toggle_theme)
-        row.addWidget(self.theme_btn)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(6)
+        buttons.addWidget(sign, 1)
+        buttons.addWidget(self.theme_btn, 1)
+        inner.addWidget(name)
+        inner.addWidget(who)
+        inner.addSpacing(6)
+        inner.addLayout(buttons)
+        col.addWidget(card)
         return bar
 
     def _update_theme_btn_icon(self):
-        theme = self.settings.value("theme", "light")
-        self.theme_btn.setText("Light" if theme == "dark" else "Dark")
+        dark = self.settings.value("theme", "light") == "dark"
+        self.theme_btn.setText("Light" if dark else "Dark")
 
     def toggle_theme(self):
-        current = self.settings.value("theme", "light")
-        new_theme = "light" if current == "dark" else "dark"
+        new_theme = "light" if self.settings.value("theme", "light") == "dark" else "dark"
         self.settings.setValue("theme", new_theme)
-        try:
-            import qdarktheme
-            if new_theme == "dark":
-                QApplication.instance().setStyleSheet(qdarktheme.load_stylesheet("dark"))
-            else:
-                QApplication.instance().setStyleSheet(STYLE)
-        except (ImportError, Exception):
-            QApplication.instance().setStyleSheet(STYLE)
+        apply_theme(new_theme)
         self._update_theme_btn_icon()
-        self.status.showMessage(
-            f"{'Dark' if new_theme == 'dark' else 'Light'} mode enabled.", 3000)
+        if self.stack.currentIndex() == 9:
+            self.load_dashboard()          # the charts are drawn in the palette's colours
+        self.status.showMessage(f"{new_theme.capitalize()} mode on.", 3000)
 
     def _rebuild_header(self):
         outer = self.centralWidget().layout()
         outer.removeWidget(self.header_widget)
+        self.header_widget.setParent(None)
         self.header_widget.deleteLater()
         self.header_widget = self._header()
         outer.insertWidget(0, self.header_widget)
 
     def show_page(self, index: int):
+        if index != self.stack.currentIndex() and self.isVisible():
+            self._fade(self.stack.widget(index))
         self.stack.setCurrentIndex(index)
         wanted = PAGE_NAMES[index]
         for button in self.tabs:
@@ -864,13 +1592,79 @@ class MainWindow(QMainWindow):
         elif index in INDEX_KIND:
             self.refresh_assets(INDEX_KIND[index])
 
+    @staticmethod
+    def _fade(page: QWidget):
+        """A short fade as a page comes in; the effect is removed afterwards so
+        the page renders at full speed."""
+        effect = QGraphicsOpacityEffect(page)
+        page.setGraphicsEffect(effect)
+        anim = QPropertyAnimation(effect, b"opacity", page)
+        anim.setDuration(160)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.finished.connect(lambda: page.setGraphicsEffect(None))
+        anim.start(QAbstractAnimation.DeleteWhenStopped)
+
     # -- employees -------------------------------------------------------
+
+    def _toolbar_button(self, bar, text, slot, name="ghost", right=None, needs_row=None):
+        """A toolbar button. Hidden when the session lacks `right`; listed in
+        `needs_row` when it only makes sense with a row selected."""
+        b = QPushButton(text)
+        b.clicked.connect(slot)
+        if name:
+            b.setObjectName(name)
+        b.setCursor(Qt.PointingHandCursor)
+        if right and not Store.may(self.role, right):
+            b.hide()
+        if needs_row is not None:
+            needs_row.append(b)
+        bar.addWidget(b)
+        return b
+
+    def _more_button(self, bar, entries) -> QPushButton | None:
+        """A 'More' drop-down for the rarely used actions. Entries are
+        (text, slot, right) or None for a separator; only permitted ones show."""
+        allowed = [e for e in entries if e is None or not e[2] or Store.may(self.role, e[2])]
+        while allowed and allowed[0] is None:
+            allowed.pop(0)
+        while allowed and allowed[-1] is None:
+            allowed.pop()
+        if not allowed:
+            return None
+        menu = QMenu(self)
+        for entry in allowed:
+            if entry is None:
+                menu.addSeparator()
+            elif len(entry) > 3 and entry[3]:            # destructive - shown in red
+                action = QWidgetAction(menu)
+                button = QPushButton(entry[0])
+                button.setObjectName("menuDanger")
+                button.setCursor(Qt.PointingHandCursor)
+                button.clicked.connect(lambda _=False, m=menu, f=entry[1]: (m.close(), f()))
+                action.setDefaultWidget(button)
+                menu.addAction(action)
+            else:
+                menu.addAction(entry[0], entry[1])
+        more = QPushButton("More")
+        more.setObjectName("more")
+        more.setCursor(Qt.PointingHandCursor)
+        more.setMenu(menu)
+        bar.addWidget(more)
+        return more
 
     def _employees_page(self) -> QWidget:
         page = QWidget()
         page.setObjectName("page")
         box = QVBoxLayout(page)
-        box.setContentsMargins(16, 12, 16, 12)
+        box.setContentsMargins(24, 18, 24, 12)
+        box.setSpacing(10)
+
+        self.count = QLabel("0 records")
+        self.count.setObjectName("count")
+        page_title(box, "Employees", "Everyone on file and the equipment issued to them",
+                   self.count)
 
         if not Store.may(self.role, "edit"):
             banner = QLabel("Read-only - you can search, view and print, but not change "
@@ -878,97 +1672,135 @@ class MainWindow(QMainWindow):
             banner.setObjectName("banner")
             box.addWidget(banner)
 
-        bar = QHBoxLayout()
-        self.search = QLineEdit(placeholderText="Search anything - name, Emp ID, department, "
-                                                "serial number, IMEI, vendor, DC no...")
+        self.search = search_box("Search anything - name, Emp ID, department, serial number, "
+                                 "IMEI, vendor, DC no...")
         self.search.textChanged.connect(self.refresh)
-        bar.addWidget(self.search, 1)
-        self.count = QLabel("0 records")
-        self.count.setObjectName("count")
-        bar.addWidget(self.count)
-
-        def button(text, slot, name=None, right=None):
-            b = QPushButton(text)
-            b.clicked.connect(slot)
-            if name:
-                b.setObjectName(name)
-            if right and not Store.may(self.role, right):
-                b.hide()
-            bar.addWidget(b)
-            return b
-
-        button("Add Employee", self.add_employee, right="edit").setShortcut("Ctrl+N")
-        button("Edit", self.edit_employee, "ghost", right="edit").setShortcut("Ctrl+E")
-        button("Delete", self.delete_employee, "danger", right="delete")
-        button("Asset History", self.show_employee_assets, "ghost")
-        button("Print Record", self.record_employee, "ghost", right="export")
-        button("Import Excel", self.import_excel, "ghost", right="import")
-        button("Email Settings", self.email_settings, "ghost", right="superadmin")
-        button("Send Email", self.compose_email, "ghost")
-
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        top.addWidget(self.search, 1)
+        files = lambda *a, **k: self._toolbar_button(top, *a, **k)     # noqa: E731
+        files("Import Excel", self.import_excel, right="import")
         self.export_buttons = [
-            button("Export Excel", self.export_excel, "ghost", right="export"),
-            button("Export CSV", self.export_csv, "ghost", right="export"),
-            button("Export PDF", self.export_pdf, "ghost", right="export"),
+            files("Export Excel", self.export_excel, right="export"),
+            files("Export PDF", self.export_pdf, right="export"),
         ]
-        if Store.may(self.role, "delete"):
-            self.btn_select_all = QPushButton("Select All")
-            self.btn_select_all.setObjectName("ghost")
-            self.btn_select_all.clicked.connect(self.select_all_employees)
-            bar.addWidget(self.btn_select_all)
+        box.addLayout(top)
 
-            self.btn_delete_selected = QPushButton("Delete Selected")
-            self.btn_delete_selected.setObjectName("danger")
-            self.btn_delete_selected.clicked.connect(self.delete_selected_employees)
-            bar.addWidget(self.btn_delete_selected)
-
-            self.btn_delete_all = QPushButton("Delete All")
-            self.btn_delete_all.setObjectName("danger")
-            self.btn_delete_all.clicked.connect(self.delete_all_employees)
-            bar.addWidget(self.btn_delete_all)
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        self.row_actions: list[QPushButton] = []
+        tb = lambda *a, **k: self._toolbar_button(bar, *a, **k)        # noqa: E731
+        tb("Add Employee", self.add_employee, None, right="edit")
+        tb("Edit", self.edit_employee, right="edit", needs_row=self.row_actions)
+        tb("Delete", self.delete_employee, "danger", right="delete", needs_row=self.row_actions)
+        bar.addWidget(divider())
+        tb("Asset History", self.show_employee_assets, needs_row=self.row_actions)
+        tb("Send Email", self.compose_email, needs_row=self.row_actions)
+        tb("Print Record", self.record_employee, right="export", needs_row=self.row_actions)
+        bar.addStretch()
+        self._more_button(bar, [
+            ("Select all rows", self.select_all_employees, None),
+            None,
+            ("Delete selected...", self.delete_selected_employees, "delete", True),
+            ("Delete all...", self.delete_all_employees, "delete", True),
+            None,
+            ("Email Settings...", self.email_settings, "users"),
+        ])
         box.addLayout(bar)
 
-        self.table = QTableWidget()
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
+        self.table = make_table()
         self.table.setSortingEnabled(True)
-        self.table.verticalHeader().setVisible(False)
-        self.table.doubleClicked.connect(self.edit_employee)
+        self.table.doubleClicked.connect(self._open_employee)
+        self.table.itemSelectionChanged.connect(self._update_row_actions)
+        self.table.horizontalHeader().sortIndicatorChanged.connect(
+            lambda col, order: self.table.isSortingEnabled()
+            and setattr(self, "emp_sort", (col, order)))
         self.table.setToolTip("Double-click a row to open it. Shift/Ctrl+click to multi-select.")
         box.addWidget(self.table, 1)
         return page
 
-    def refresh(self):
-        self.rows = self.store.employees(self.search.text())
-        headers = [LABELS[c] for c in COLUMNS] + ["Last Updated", "Updated By"]
-        self.table.setSortingEnabled(False)
-        self.table.clear()
-        self.table.setColumnCount(len(headers))
-        self.table.setHorizontalHeaderLabels(headers)
-        self.table.setRowCount(len(self.rows))
-        for r, row in enumerate(self.rows):
-            values = [str(row[c]) for c in COLUMNS] + \
-                     [local_time(row["updated"]), row["updated_by"]]
-            for c, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if c == 0:
-                    # The table sorts, so the row number on screen is not a
-                    # position in self.rows - carry the real one, or Edit,
-                    # Delete and Print Record act on the wrong employee.
-                    item.setData(Qt.UserRole, r)
-                self.table.setItem(r, c, item)
+    def _open_employee(self):
+        """Double-click: edit for an editor, the asset history for everyone else."""
+        if Store.may(self.role, "edit"):
+            self.edit_employee()
+        else:
+            self.show_employee_assets()
 
-        # Sort by join_date (index 2 in COLUMNS)
-        self.table.sortItems(2, Qt.AscendingOrder)
-        self.table.setSortingEnabled(True)
-        self.table.resizeColumnsToContents()
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.count.setText(f"{len(self.rows)} record{'' if len(self.rows) == 1 else 's'}")
+    def _update_row_actions(self):
+        picked = bool(self.table.selectionModel() and self.table.selectionModel().selectedRows())
+        for button in self.row_actions:
+            button.setEnabled(picked)
+
+    @staticmethod
+    def _fill(table: QTableWidget, headers: list[str], rows: list[list[str]]):
+        """Load a table. Row 0's cells carry their index into the source list,
+        so a header-click sort still maps back to the right record."""
+        table.setSortingEnabled(False)
+        table.clear()
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setRowCount(len(rows))
+        for r, values in enumerate(rows):
+            for c, value in enumerate(values):
+                item = SortItem(value)
+                if c == 0:
+                    item.setData(Qt.UserRole, r)
+                table.setItem(r, c, item)
+        table.resizeColumnsToContents()
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        for c in range(table.columnCount()):          # a long remark must not eat the screen
+            if table.columnWidth(c) > 320:
+                table.setColumnWidth(c, 320)
+
+    def refresh(self):
+        search = self.search.text()
+        self.rows = self.store.employees(search)
+        headers = [LABELS[c] for c in COLUMNS] + ["Last Updated", "Updated By"]
+        self._fill(self.table, headers,
+                   [[str(row[c]) for c in COLUMNS] + [local_time(row["updated"]), row["updated_by"]]
+                    for row in self.rows])
+        self._show_order(self.table, search, self.emp_sort)
+        n = len(self.rows)
+        if search.strip():
+            self.count.setText(f"{n} of {self.store.employee_count()} records")
+        else:
+            self.count.setText(f"{n} record{'' if n == 1 else 's'}")
         for button in self.export_buttons:
             button.setEnabled(bool(self.rows))
             button.setToolTip("" if self.rows else "Nothing to export - the list is empty")
+        self._update_row_actions()
+
+    @staticmethod
+    def _show_order(table: QTableWidget, search: str, sort: tuple):
+        """Browsing: the chosen column order (SNO 1, 2, 3 by default).
+        Searching: best match on top, matched cells highlighted, and the view
+        jumps to the first hit so it is never lost at the bottom."""
+        header = table.horizontalHeader()
+        words = [w.lower() for w in search.split()]
+        if not words:
+            header.setSortIndicatorShown(True)
+            header.setSortIndicator(*sort)
+            table.setSortingEnabled(True)
+            return
+        table.setSortingEnabled(False)            # keep the relevance order
+        header.setSortIndicatorShown(False)
+        # Highlight where a word *starts* with the search ('Hammad'), not where
+        # it is buried inside another word ('Muhammad') - the real hits stand out.
+        starts = [re.compile(r"(?<![a-z0-9])" + re.escape(w)) for w in words]
+        bold = QFont(table.font())
+        bold.setBold(True)
+        brand = QColor(PALETTE["brand"])
+        for r in range(table.rowCount()):
+            for c in range(table.columnCount()):
+                item = table.item(r, c)
+                text = item.text().lower() if item else ""
+                if text and any(p.search(text) for p in starts):
+                    item.setFont(bold)
+                    item.setForeground(brand)
+        table.scrollToTop()
+        if table.rowCount():
+            table.selectRow(0)
 
     @staticmethod
     def _record_at(table, source: list, view_row: int) -> dict | None:
@@ -997,6 +1829,7 @@ class MainWindow(QMainWindow):
         return [r for r in picked if r is not None]
 
     def select_all_employees(self):
+        self.table.setFocus()
         self.table.selectAll()
 
     def add_employee(self):
@@ -1037,13 +1870,16 @@ class MainWindow(QMainWindow):
     def delete_employee(self):
         if not self.ensure("delete", "Sign in as a super admin to delete employees."):
             return
+        if len(self.selected_records()) > 1:
+            self.delete_selected_employees()
+            return
         row = self.selected()
         if not row:
             return
-        if QMessageBox.question(self, "Delete record",
-                                f"Delete the record for {row['emp_name']} ({row['emp_id']})?\n\n"
-                                "Any assets they hold will be released immediately.",
-                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+        if not confirm_danger(self, "Delete employee",
+                              f"Delete the record for {row['emp_name'] or row['emp_id']} "
+                              f"({row['emp_id']}, SNO {row['sno']})?\n\n"
+                              "The Activity Log keeps a copy of the deleted record."):
             return
         try:
             self.store.delete_employee(row["id"], self.username, self.role)
@@ -1054,20 +1890,33 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Employee deleted.", 4000)
 
     def email_settings(self):
-        dialog = EmailConfigDialog(self)
-        dialog.exec_()
+        if not self.ensure("users", "Only the super admin can change the email settings."):
+            return
+        if EmailConfigDialog(self).exec_() == QDialog.Accepted:
+            self.status.showMessage("Email settings saved.", 4000)
 
     def compose_email(self):
-        row = self.selected()
-        if not row:
+        records = self.selected_records()
+        if not records:
+            warn(self, "Select one or more employee rows first.")
             return
-        to_email = row.get("email")
-        if not to_email:
-            warn(self, "Selected employee does not have an email address.")
+        if not self.ensure("edit", "Sign in as a super admin to send email."):
             return
-        dialog = ComposeEmailDialog(self, to_email)
-        dialog.exec_()
-
+        with_mail = [r for r in records if (r.get("email") or "").strip()]
+        missing = [r["emp_name"] or r["emp_id"] for r in records if r not in with_mail]
+        if not with_mail:
+            warn(self, "The selected employee(s) have no email address on file.\n\n"
+                 "Add one with Edit, then try again.")
+            return
+        if missing:
+            self.status.showMessage(f"No email address for: {', '.join(missing[:5])}"
+                                    f"{' ...' if len(missing) > 5 else ''} - left out.", 8000)
+        dialog = ComposeEmailDialog(self, with_mail, self.store.company().get("name", ""))
+        if dialog.exec_() == QDialog.Accepted and dialog.sent:
+            self.store.log(self.username, "email", "employee",
+                           ", ".join(r["emp_id"] for r in with_mail)[:200],
+                           f"'{dialog.template.currentText()}' sent to "
+                           f"{len(dialog.sent)} recipient(s)")
 
     def delete_selected_employees(self):
         if not self.ensure("delete", "Sign in as a super admin to delete employees."):
@@ -1079,24 +1928,25 @@ class MainWindow(QMainWindow):
         names = ", ".join((r['emp_name'] or r['emp_id']) for r in records[:5])
         if len(records) > 5:
             names += f" ... and {len(records) - 5} more"
-        answer = QMessageBox.question(
-            self, "Delete selected employees",
-            f"Permanently delete {len(records)} employee(s)?\n\n{names}\n\n"
-            "The Activity Log will keep a copy of every deleted record.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if answer != QMessageBox.Yes:
+        if not confirm_danger(self, "Delete selected employees",
+                              f"Permanently delete {len(records)} employee(s)?\n\n{names}\n\n"
+                              "The Activity Log will keep a copy of every deleted record.",
+                              f"Delete {len(records)}"):
             return
-        failed = 0
-        for record in records:
-            try:
-                self.store.delete_employee(record["id"], self.username, self.role)
-            except (Invalid, Denied):
-                failed += 1
+        self._delete_many([r["id"] for r in records], 6000)
+
+    def _delete_many(self, ids: list[int], ms: int):
+        """One transaction: either every chosen record goes, or none does."""
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            deleted = self.store.delete_employees(ids, self.username, self.role)
+        except (Invalid, Denied) as exc:
+            QApplication.restoreOverrideCursor()
+            warn(self, f"Nothing was deleted:\n{exc}")
+            return
+        QApplication.restoreOverrideCursor()
         self.refresh()
-        msg = f"Deleted {len(records) - failed} employee(s)."
-        if failed:
-            msg += f" {failed} could not be deleted."
-        self.status.showMessage(msg, 6000)
+        self.status.showMessage(f"Deleted {deleted} employee(s).", ms)
 
     def delete_all_employees(self):
         if not self.ensure("delete", "Sign in as a super admin to delete employees."):
@@ -1107,31 +1957,17 @@ class MainWindow(QMainWindow):
         total = len(self.rows)
         filtered = self.search.text().strip()
         scope = f"matching '{filtered}'" if filtered else "in the entire database"
-        answer = QMessageBox.question(
-            self, "Delete ALL employees",
-            f"You are about to permanently delete ALL {total} employee record(s) {scope}.\n\n"
-            "This cannot be undone, though the Activity Log will keep a copy.\n\n"
-            "Are you absolutely sure?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if answer != QMessageBox.Yes:
+        if not confirm_danger(
+                self, "Delete ALL employees",
+                f"You are about to permanently delete ALL {total} employee record(s) {scope}.\n\n"
+                "This cannot be undone, though the Activity Log will keep a copy.",
+                "Continue"):
             return
-        answer2 = QMessageBox.warning(
-            self, "Final confirmation",
-            f"Delete {total} record(s)? This is your last chance to cancel.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if answer2 != QMessageBox.Yes:
+        if not confirm_danger(self, "Final confirmation",
+                              f"Delete {total} record(s)? This is your last chance to cancel.",
+                              f"Delete all {total}"):
             return
-        failed = 0
-        for record in list(self.rows):
-            try:
-                self.store.delete_employee(record["id"], self.username, self.role)
-            except (Invalid, Denied):
-                failed += 1
-        self.refresh()
-        msg = f"Deleted {total - failed} employee(s)."
-        if failed:
-            msg += f" {failed} could not be deleted."
-        self.status.showMessage(msg, 8000)
+        self._delete_many([r["id"] for r in list(self.rows)], 8000)
 
     def show_employee_assets(self):
         record = self.selected()
@@ -1148,59 +1984,74 @@ class MainWindow(QMainWindow):
         page = QWidget()
         page.setObjectName("page")
         box = QVBoxLayout(page)
-        box.setContentsMargins(16, 12, 16, 12)
+        box.setContentsMargins(24, 18, 24, 12)
+        box.setSpacing(10)
 
-        bar = QHBoxLayout()
-        search = QLineEdit(placeholderText=f"Search {meta['tab'].lower()} - serial, model, "
-                                           "owner, vendor...")
-        search.textChanged.connect(lambda _=None, k=kind: self.refresh_assets(k))
-        self.asset_search = getattr(self, "asset_search", {})
-        self.asset_search[kind] = search
-        bar.addWidget(search, 1)
         count = QLabel("0 assets")
         count.setObjectName("count")
         self.asset_count = getattr(self, "asset_count", {})
         self.asset_count[kind] = count
-        bar.addWidget(count)
+        page_title(box, meta["tab"], f"Every {meta['label'].lower()} on file, who holds it "
+                   "and its history", count)
 
-        def button(text, slot, name=None, right=None):
-            b = QPushButton(text)
-            b.clicked.connect(slot)
-            if name:
-                b.setObjectName(name)
-            if right and not Store.may(self.role, right):
-                b.hide()
-            bar.addWidget(b)
-            return b
+        search = search_box(f"Search {meta['tab'].lower()} - serial, model, owner, vendor...")
+        search.textChanged.connect(lambda _=None, k=kind: self.refresh_assets(k))
+        self.asset_search = getattr(self, "asset_search", {})
+        self.asset_search[kind] = search
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        top.addWidget(search, 1)
+        for fmt in ("Excel", "PDF"):
+            self.asset_export_buttons[kind].append(self._toolbar_button(
+                top, f"Export {fmt}", lambda _=None, k=kind, f=fmt: self.export_assets(k, f),
+                right="export"))
+        box.addLayout(top)
 
-        button(f"Add {meta['label']}", lambda _=None, k=kind: self.add_asset(k), right="edit")
-        button("Edit", lambda _=None, k=kind: self.edit_asset(k), "ghost", right="edit")
-        button("Assign", lambda _=None, k=kind: self.assign_asset(k), "ghost", right="edit")
-        button("Release", lambda _=None, k=kind: self.release_asset(k), "ghost", right="edit")
-        button("History", lambda _=None, k=kind: self.show_asset_history(k), "ghost")
-
-        button("Print Record", lambda _=None, k=kind: self.record_asset(k), "ghost",
-               right="export")
-        button("Delete", lambda _=None, k=kind: self.delete_asset(k), "danger", right="delete")
-        for fmt in ("Excel", "CSV", "PDF"):
-            self.asset_export_buttons[kind].append(
-                button(f"Export {fmt}", lambda _=None, k=kind, f=fmt: self.export_assets(k, f),
-                       "ghost", right="export"))
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        needs = []
+        self.asset_row_actions = getattr(self, "asset_row_actions", {})
+        self.asset_row_actions[kind] = needs
+        tb = lambda *a, **k: self._toolbar_button(bar, *a, **k)        # noqa: E731
+        tb(f"Add {meta['label']}", lambda _=None, k=kind: self.add_asset(k), None, right="edit")
+        tb("Edit", lambda _=None, k=kind: self.edit_asset(k), right="edit", needs_row=needs)
+        tb("Delete", lambda _=None, k=kind: self.delete_asset(k), "danger", right="delete",
+           needs_row=needs)
+        bar.addWidget(divider())
+        tb("Assign", lambda _=None, k=kind: self.assign_asset(k), right="edit", needs_row=needs)
+        tb("Release", lambda _=None, k=kind: self.release_asset(k), right="edit",
+           needs_row=needs)
+        tb("History", lambda _=None, k=kind: self.show_asset_history(k), needs_row=needs)
+        tb("Print Record", lambda _=None, k=kind: self.record_asset(k), right="export",
+           needs_row=needs)
+        bar.addStretch()
         box.addLayout(bar)
 
-        table = QTableWidget()
-        table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        table.setAlternatingRowColors(True)
+        table = make_table()
         table.setSortingEnabled(True)
-        table.verticalHeader().setVisible(False)
-        table.doubleClicked.connect(lambda _=None, k=kind: self.edit_asset(k))
+        table.doubleClicked.connect(lambda _=None, k=kind: self._open_asset(k))
+        table.itemSelectionChanged.connect(lambda k=kind: self._update_asset_actions(k))
         table.setToolTip("Double-click a row to open it. Shift/Ctrl+click to multi-select.")
         self.asset_table = getattr(self, "asset_table", {})
         self.asset_table[kind] = table
+        self.asset_sort = getattr(self, "asset_sort", {})
+        table.horizontalHeader().sortIndicatorChanged.connect(
+            lambda col, order, k=kind, t=table: t.isSortingEnabled()
+            and self.asset_sort.__setitem__(k, (col, order)))
         box.addWidget(table, 1)
         return page
+
+    def _open_asset(self, kind: str):
+        if Store.may(self.role, "edit"):
+            self.edit_asset(kind)
+        else:
+            self.show_asset_history(kind)
+
+    def _update_asset_actions(self, kind: str):
+        model = self.asset_table[kind].selectionModel()
+        picked = bool(model and model.selectedRows())
+        for button in self.asset_row_actions[kind]:
+            button.setEnabled(picked)
 
     def refresh_assets(self, kind: str):
         table = self.asset_table[kind]
@@ -1209,23 +2060,16 @@ class MainWindow(QMainWindow):
         meta = ASSET_META[kind]
         labels = _asset_labels(meta)
         headers = ["Sno"] + [labels[c] for c in meta["columns"]] + ["Last Updated", "Updated By"]
-        table.setSortingEnabled(False)
-        table.clear()
-        table.setColumnCount(len(headers))
-        table.setHorizontalHeaderLabels(headers)
-        table.setRowCount(len(rows))
-        for r, row in enumerate(rows):
-            values = [str(r + 1)] + [row[c] for c in meta["columns"]] + \
-                     [local_time(row["updated"]), row["updated_by"]]
-            for c, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if c == 0:
-                    item.setData(Qt.UserRole, r)      # survives a header-click sort
-                table.setItem(r, c, item)
-        table.setSortingEnabled(True)
-        table.resizeColumnsToContents()
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self._fill(table, headers,
+                   [[str(r + 1)] + [row[c] for c in meta["columns"]] +
+                    [local_time(row["updated"]), row["updated_by"]]
+                    for r, row in enumerate(rows)])
+        self._show_order(table, self.asset_search[kind].text(),
+                         self.asset_sort.get(kind, (0, Qt.AscendingOrder)))
         self.asset_count[kind].setText(f"{len(rows)} asset{'' if len(rows) == 1 else 's'}")
+        for button in self.asset_export_buttons[kind]:
+            button.setEnabled(bool(rows))
+        self._update_asset_actions(kind)
 
     def _selected_asset(self, kind: str) -> dict | None:
         table = self.asset_table[kind]
@@ -1345,13 +2189,11 @@ class MainWindow(QMainWindow):
         record = self._selected_asset(kind)
         if not record:
             return
-        answer = QMessageBox.question(
-            self, f"Delete {ASSET_META[kind]['label'].lower()}",
-            f"Delete {record['identity']} ({record['name_type'] or 'no model'})?\n\n"
-            "The row is removed, but the Activity Log keeps a copy and the assignment "
-            "history is preserved.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if answer != QMessageBox.Yes:
+        if not confirm_danger(
+                self, f"Delete {ASSET_META[kind]['label'].lower()}",
+                f"Delete {record['identity']} ({record['name_type'] or 'no model'})?\n\n"
+                "The row is removed, but the Activity Log keeps a copy and the assignment "
+                "history is preserved."):
             return
         try:
             self.store.delete_asset(record["id"], self.username, self.role)
@@ -1369,7 +2211,7 @@ class MainWindow(QMainWindow):
             warn(self, "There is nothing to export.")
             return
         meta = ASSET_META[kind]
-        ext = {"Excel": ".xlsx", "CSV": ".csv", "PDF": ".pdf"}[fmt]
+        ext = {"Excel": ".xlsx", "PDF": ".pdf"}[fmt]
         suggested = str(Path.home() / "Downloads" / f"{kind}s{ext}")
         path, _ = QFileDialog.getSaveFileName(self, f"Save {fmt}", suggested, f"{fmt} (*{ext})")
         if not path:
@@ -1379,8 +2221,6 @@ class MainWindow(QMainWindow):
         try:
             if fmt == "Excel":
                 written = export_excel(rows, path, columns=columns, labels=labels)
-            elif fmt == "CSV":
-                written = export_csv(rows, path, columns=columns, labels=labels)
             else:
                 written = export_pdf(rows, path, columns=columns, labels=labels,
                                      title=f"{meta['tab']} register")
@@ -1522,9 +2362,6 @@ class MainWindow(QMainWindow):
     def export_excel(self):
         self._export("Excel", ".xlsx", lambda rows, path: export_excel(rows, path))
 
-    def export_csv(self):
-        self._export("CSV", ".csv", lambda rows, path: export_csv(rows, path))
-
     def export_pdf(self):
         filtered = self.search.text().strip()
         subtitle = f"Filtered by '{filtered}'" if filtered else "All employees"
@@ -1569,25 +2406,16 @@ class MainWindow(QMainWindow):
         page = QWidget()
         page.setObjectName("page")
         box = QVBoxLayout(page)
-        box.setContentsMargins(16, 12, 16, 12)
-        title = QLabel("Every add, edit, delete, export, assignment and sign-in. "
-                       "Nothing here is ever changed.")
-        title.setObjectName("subtitle")
-        box.addWidget(title)
-
-        bar = QHBoxLayout()
-        self.log_search = QLineEdit(placeholderText="Search the log - who, what, which employee/asset")
-        self.log_search.textChanged.connect(self.load_logs)
-        bar.addWidget(self.log_search, 1)
+        box.setContentsMargins(24, 18, 24, 12)
+        box.setSpacing(10)
         self.log_count = QLabel("0 entries")
         self.log_count.setObjectName("count")
-        bar.addWidget(self.log_count)
-        box.addLayout(bar)
-
-        self.log_table = QTableWidget()
-        self.log_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.log_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.log_table.verticalHeader().setVisible(False)
+        page_title(box, "Activity Log", "Every add, edit, delete, export, assignment and "
+                   "sign-in. Nothing here is ever changed.", self.log_count)
+        self.log_search = search_box("Search the log - who, what, which employee/asset")
+        self.log_search.textChanged.connect(self.load_logs)
+        box.addWidget(self.log_search)
+        self.log_table = make_table(multi=False)
         box.addWidget(self.log_table, 1)
         return page
 
@@ -1615,25 +2443,20 @@ class MainWindow(QMainWindow):
         page = QWidget()
         page.setObjectName("page")
         box = QVBoxLayout(page)
-        box.setContentsMargins(16, 12, 16, 12)
+        box.setContentsMargins(24, 18, 24, 12)
+        box.setSpacing(10)
+        page_title(box, "Users", "Accounts that can sign in to IT Records")
 
         bar = QHBoxLayout()
-        bar.addWidget(QLabel("Accounts that can sign in to IT Records"))
-        bar.addStretch()
+        bar.setSpacing(6)
         for text, slot, name in [("Add User", self.add_user, None),
                                  ("Reset Password", self.reset_password, "ghost"),
                                  ("Delete User", self.delete_user, "danger")]:
-            button = QPushButton(text)
-            button.clicked.connect(slot)
-            if name:
-                button.setObjectName(name)
-            bar.addWidget(button)
+            self._toolbar_button(bar, text, slot, name)
+        bar.addStretch()
         box.addLayout(bar)
 
-        self.user_table = QTableWidget()
-        self.user_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.user_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.user_table.verticalHeader().setVisible(False)
+        self.user_table = make_table(multi=False)
         box.addWidget(self.user_table, 1)
 
         legend = QLabel("   ".join(f"•  {d}" for d in ROLES.values()))
@@ -1697,8 +2520,9 @@ class MainWindow(QMainWindow):
         user = self.selected_user()
         if not user:
             return
-        if QMessageBox.question(self, "Delete user", f"Delete the account {user['username']}?",
-                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+        if not confirm_danger(self, "Delete user",
+                              f"Delete the account {user['username']}? They will no longer "
+                              "be able to sign in."):
             return
         try:
             self.store.delete_user(user["username"], self.username, self.role)
@@ -1714,21 +2538,35 @@ class MainWindow(QMainWindow):
         page = QWidget()
         page.setObjectName("page")
         box = QVBoxLayout(page)
-        box.setContentsMargins(16, 12, 16, 12)
+        box.setContentsMargins(24, 18, 24, 12)
         box.setSpacing(10)
-
-        title = QLabel("Dashboard - A visual overview of your IT records.")
-        title.setObjectName("subtitle")
-        box.addWidget(title)
-
-        scroll = QScrollArea(widgetResizable=True, frameShape=QScrollArea.NoFrame)
+        page_title(box, "Dashboard", "An overview of the registers and data quality")
+        self.dashboard_scroll = QScrollArea(widgetResizable=True, frameShape=QScrollArea.NoFrame)
+        box.addWidget(self.dashboard_scroll, 1)
         holder = QWidget()
-        holder.setObjectName("page")
-        self.dashboard_layout = QVBoxLayout(holder)
-        self.dashboard_layout.addStretch()
-        scroll.setWidget(holder)
-        box.addWidget(scroll, 1)
+        self.dashboard_layout = QVBoxLayout(holder)       # replaced on every load
+        self.dashboard_scroll.setWidget(holder)
         return page
+
+    @staticmethod
+    def _tile(value, label: str, note: str = "") -> QWidget:
+        tile = QWidget()
+        tile.setObjectName("tile")
+        tile.setAttribute(Qt.WA_StyledBackground, True)
+        col = QVBoxLayout(tile)
+        col.setContentsMargins(16, 12, 16, 12)
+        col.setSpacing(0)
+        number = QLabel(str(value))
+        number.setObjectName("tileValue")
+        name = QLabel(label)
+        name.setObjectName("tileLabel")
+        col.addWidget(number)
+        col.addWidget(name)
+        if note:
+            extra = QLabel(note)
+            extra.setObjectName("subtitle")
+            col.addWidget(extra)
+        return tile
 
     @staticmethod
     def _stat_box(title: str, lines: list[str]) -> QWidget:
@@ -1741,19 +2579,25 @@ class MainWindow(QMainWindow):
         return group
 
     def load_dashboard(self):
-        while self.dashboard_layout.count():
-            item = self.dashboard_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        # A fresh holder each time: the old one (charts, grids and all) goes with
+        # it, so nothing from the previous load is left drawn underneath.
+        holder = QWidget()
+        holder.setObjectName("page")
+        self.dashboard_layout = QVBoxLayout(holder)
+        self.dashboard_layout.setContentsMargins(0, 0, 0, 0)
+        self.dashboard_layout.setSpacing(12)
 
         stats = self.store.stats()
 
-        headline = QLabel(f"<b>{stats['total']}</b> employee record(s) on file")
-        self.dashboard_layout.addWidget(headline)
+        tiles = QHBoxLayout()
+        tiles.setSpacing(10)
+        tiles.addWidget(self._tile(stats["total"], "Employees"))
+        for a in stats["assets_by_kind"]:
+            tiles.addWidget(self._tile(a["total"], a["label"], f"{a['issued']} issued"))
+        self.dashboard_layout.addLayout(tiles)
 
         grid = QGridLayout()
-
-        # --- matplotlib charts (optional) ---
+        grid.setSpacing(12)
         try:
             import matplotlib
             matplotlib.use("Agg")  # non-interactive backend
@@ -1764,47 +2608,47 @@ class MainWindow(QMainWindow):
             def make_bar_chart(data: list, title: str) -> QLabel | None:
                 if not data:
                     return None
-                labels, values = zip(*data) if data else ([], [])
-                fig, ax = plt.subplots(figsize=(4, 2.5))
-                fig.patch.set_facecolor('#f5f7f7')
-                ax.set_facecolor('#f5f7f7')
-                bars = ax.barh(labels, values, color='#006a63')
-                ax.bar_label(bars, padding=3, fontsize=8)
-                ax.set_title(title, fontsize=9, fontweight='bold')
-                ax.tick_params(labelsize=7)
-                ax.spines['top'].set_visible(False)
-                ax.spines['right'].set_visible(False)
+                labels, values = zip(*data)
+                fig, ax = plt.subplots(figsize=(5, 2.8))
+                fig.patch.set_facecolor(PALETTE["bg"])
+                ax.set_facecolor(PALETTE["bg"])
+                bars = ax.barh(labels, values, color=PALETTE["brand"])
+                ax.bar_label(bars, padding=3, fontsize=8, color=PALETTE["text"])
+                ax.set_title(title, fontsize=10, fontweight="bold", color=PALETTE["text"],
+                             loc="left")
+                ax.tick_params(labelsize=8, colors=PALETTE["muted"])
+                ax.invert_yaxis()                        # largest first, top down
+                for side in ("top", "right"):
+                    ax.spines[side].set_visible(False)
+                for side in ("left", "bottom"):
+                    ax.spines[side].set_color(PALETTE["border"])
                 plt.tight_layout()
+                ratio = self.devicePixelRatioF()           # sharp on a scaled display
                 buf = BytesIO()
-                fig.savefig(buf, format='png', dpi=100)
+                fig.savefig(buf, format="png", dpi=100 * ratio)
                 plt.close(fig)
-                buf.seek(0)
                 pixmap = QPixmap()
-                pixmap.loadFromData(buf.read())
+                pixmap.loadFromData(buf.getvalue())
+                pixmap.setDevicePixelRatio(ratio)
                 lbl = QLabel()
                 lbl.setPixmap(pixmap)
+                lbl.setMinimumSize(pixmap.size() / ratio)
                 lbl.setAlignment(Qt.AlignCenter)
                 return lbl
 
-            dept_chart = make_bar_chart(stats["by_department"], "Employees by Department")
-            if dept_chart:
-                grid.addWidget(dept_chart, 0, 0)
-
-            region_chart = make_bar_chart(stats["by_region"], "Employees by Region")
-            if region_chart:
-                grid.addWidget(region_chart, 0, 1)
-
-            status_chart = make_bar_chart(stats["by_status"], "Employees by Status")
-            if status_chart:
-                grid.addWidget(status_chart, 1, 0)
-
-            asset_data = [(a['label'], a['total']) for a in stats["assets_by_kind"]]
-            assets_chart = make_bar_chart(asset_data, "Assets by Type")
-            if assets_chart:
-                grid.addWidget(assets_chart, 1, 1)
-
+            charts = [(stats["by_department"], "Employees by department"),
+                      (stats["by_region"], "Employees by region"),
+                      (stats["by_status"], "Employees by status"),
+                      ([(a["label"], a["total"]) for a in stats["assets_by_kind"]],
+                       "Assets by type")]
+            placed = 0
+            for data, title in charts:
+                chart = make_bar_chart(data, title)
+                if chart:
+                    grid.addWidget(chart, placed // 2, placed % 2)
+                    placed += 1
         except ImportError:
-            # Fallback to text boxes if matplotlib is not installed
+            # Text summaries when matplotlib is not installed
             grid.addWidget(self._stat_box(
                 "By status", [f"{name}: {n}" for name, n in stats["by_status"]]), 0, 0)
             grid.addWidget(self._stat_box(
@@ -1812,7 +2656,6 @@ class MainWindow(QMainWindow):
             grid.addWidget(self._stat_box(
                 "Top departments", [f"{name}: {n}" for name, n in stats["by_department"]]), 1, 0)
 
-        # Always show summary boxes
         grid.addWidget(self._stat_box("Asset registers", [
             f"{a['label']}: {a['total']} on file, {a['issued']} currently issued"
             for a in stats["assets_by_kind"]
@@ -1821,43 +2664,42 @@ class MainWindow(QMainWindow):
             f"No email address: {stats['missing_email']}",
             f"No contact number: {stats['missing_contact']}",
         ]), 2, 1)
-        self.dashboard_layout.insertLayout(1, grid)
+        self.dashboard_layout.addLayout(grid)
 
         # --- Data Integrity Cross-Check ---
-        integrity_title = QLabel("<b>Data Integrity - Serial Number Cross-Check</b>")
-        integrity_title.setStyleSheet("margin-top: 12px;")
+        integrity_title = QLabel("<b>Data integrity - serial number cross-check</b>")
+        integrity_title.setStyleSheet("margin-top: 8px; font-size: 11pt;")
         self.dashboard_layout.addWidget(integrity_title)
 
         issues = self.store.cross_check_serials()
         total_issues = sum(len(v) for v in issues.values())
-
         if total_issues == 0:
             ok_label = QLabel("No mismatches found. All serial numbers are consistent.")
-            ok_label.setStyleSheet("color: #006a63; font-weight: bold; padding: 8px;")
+            ok_label.setObjectName("ok")
             self.dashboard_layout.addWidget(ok_label)
         else:
             warn_label = QLabel(
                 f"Found {total_issues} mismatch(es) between employee records and asset registers:")
-            warn_label.setStyleSheet("color: #d7282f; font-weight: bold; padding: 4px;")
+            warn_label.setObjectName("error")
             self.dashboard_layout.addWidget(warn_label)
-
             integrity_grid = QGridLayout()
-            col = 0
             labels = {
-                "laptop": "Laptop Serial Mismatches",
-                "mobile": "Mobile Serial Mismatches",
-                "printer": "Printer Serial Mismatches",
-                "unassigned_laptop": "Laptops with Missing Assignment",
+                "laptop": "Laptop serial mismatches",
+                "mobile": "Mobile serial mismatches",
+                "printer": "Printer serial mismatches",
+                "unassigned_laptop": "Laptops with missing assignment",
             }
-            row_pos = 0
+            placed = 0
             for key, items in issues.items():
                 if items:
-                    box = self._stat_box(labels[key], items[:20])
-                    integrity_grid.addWidget(box, row_pos // 2, row_pos % 2)
-                    row_pos += 1
+                    shown = items[:20] + ([f"... and {len(items) - 20} more"]
+                                          if len(items) > 20 else [])
+                    integrity_grid.addWidget(self._stat_box(labels.get(key, key), shown),
+                                             placed // 2, placed % 2)
+                    placed += 1
             self.dashboard_layout.addLayout(integrity_grid)
-
         self.dashboard_layout.addStretch()
+        self.dashboard_scroll.setWidget(holder)      # attach once it is complete
 
     # -- my account ------------------------------------------------------
 
@@ -1865,9 +2707,10 @@ class MainWindow(QMainWindow):
         page = QWidget()
         page.setObjectName("page")
         box = QVBoxLayout(page)
-        box.setContentsMargins(16, 12, 16, 12)
+        box.setContentsMargins(24, 18, 24, 12)
+        box.setSpacing(10)
         if self.role == "viewer":
-            box.addWidget(QLabel("<b>Not signed in</b>"))
+            page_title(box, "My Account", "Not signed in")
             box.addWidget(QLabel(
                 "The register is open read-only. Sign in to add or edit employees and "
                 "assets, manage accounts and export."))
@@ -1880,21 +2723,21 @@ class MainWindow(QMainWindow):
             sign.clicked.connect(self.sign_in)
             box.addWidget(sign)
         else:
-            box.addWidget(QLabel(f"<b>Signed in as {self.username}</b>"))
-            box.addWidget(QLabel(ROLES[self.role]))
+            page_title(box, "My Account", f"Signed in as {self.username} - {ROLES[self.role]}")
             info = QLabel(f"Database file:  {self.store.path}")
             info.setObjectName("subtitle")
             info.setTextInteractionFlags(Qt.TextSelectableByMouse)
             box.addWidget(info)
 
             change = QPushButton("Change my password")
+            change.setObjectName("ghost")
             change.setMaximumWidth(220)
             change.clicked.connect(self.change_own_password)
             box.addWidget(change)
 
             co = self.store.company()
             group = QGroupBox("Organisation detail - printed on every record document")
-            group.setMaximumWidth(560)
+            group.setMaximumWidth(620)
             form = QFormLayout(group)
             self.company_inputs: dict[str, QLineEdit] = {}
             for key, label in (("name", "Company name"), ("address", "Address"),
@@ -1920,6 +2763,18 @@ class MainWindow(QMainWindow):
             note.setWordWrap(True)
             box.addWidget(group)
             box.addWidget(note)
+
+            if Store.may(self.role, "users"):
+                mail = QGroupBox("Email")
+                mail.setMaximumWidth(620)
+                row = QHBoxLayout(mail)
+                row.addWidget(QLabel(f"Emails are sent from  <b>{email_config()['smtp_email']}</b>"))
+                row.addStretch()
+                edit_mail = QPushButton("Email Settings")
+                edit_mail.setObjectName("ghost")
+                edit_mail.clicked.connect(self.email_settings)
+                row.addWidget(edit_mail)
+                box.addWidget(mail)
         box.addStretch()
         return page
 
@@ -2007,16 +2862,9 @@ def main() -> int:
     sys.excepthook = _handle_exception
 
     _log.info("Application starting")
-    # Apply saved theme preference on startup
-    saved_theme = QSettings("ITRecords", "IT Records").value("theme", "light")
-    try:
-        import qdarktheme
-        if saved_theme == "dark":
-            app.setStyleSheet(qdarktheme.load_stylesheet("dark"))
-        else:
-            app.setStyleSheet(STYLE)
-    except (ImportError, Exception):
-        app.setStyleSheet(STYLE)
+    apply_theme(QSettings("ITRecords", "IT Records").value("theme", "light"))
+    fade = FadeIn(app)
+    app.installEventFilter(fade)
 
     app.setFont(QFont("Segoe UI", 10))
     icon = _app_icon()

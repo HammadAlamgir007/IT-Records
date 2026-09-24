@@ -28,7 +28,8 @@ It provides a searchable employee register plus dedicated hardware registers for
 - Import workflows:
   - employee Excel import with preview,
   - source-file rebuild via `build_import_file.py`.
-- Exports for employees and asset registers: **Excel, CSV, PDF**.
+- Exports for employees and asset registers: **Excel and PDF**.
+- Send Email to one or many selected employees from a configured sender account.
 - Role-based access (`viewer`, `user`, `superadmin`) and activity log.
 - Dashboard summaries for inventory and employee record coverage.
 - Packaged **Windows** desktop executable support using PyInstaller.
@@ -54,7 +55,7 @@ It provides a searchable employee register plus dedicated hardware registers for
 - **GUI framework:** PyQt5
 - **Storage:** SQLite (`employees.db`)
 - **Spreadsheet I/O:** openpyxl
-- **Export formats:** Excel (`.xlsx`), CSV, PDF
+- **Export formats:** Excel (`.xlsx`), PDF
 - **Target environment:** Desktop usage, including Windows executable packaging via PyInstaller
 
 ## Quick start
@@ -75,7 +76,7 @@ The app opens in read-only viewer mode until a privileged user signs in.
 | Add/edit/delete/assign/release assets | no | no | yes |
 | View asset history | yes | yes | yes |
 | Manage users and view activity log | no | no | yes |
-| Excel/CSV/PDF export, Excel import | no | no | yes |
+| Excel/PDF export, Excel import | no | no | yes |
 
 ## Asset assignment and lifecycle history
 
@@ -106,10 +107,11 @@ python build_import_file.py --rebuild --keep-accounts
 
 ### Export
 
+The employee register is always listed by **SNO (1, 2, 3 ...)**. The app keeps SNO gap-free: new and imported employees join the end, and deleting one closes the gap.
+
 Superadmins can export employee and asset register views to:
 
 - Excel (`.xlsx`)
-- CSV
 - PDF
 
 ## Windows build (PyInstaller)
@@ -139,6 +141,17 @@ Optional override:
 Backup guidance:
 
 - Close the app before copying `employees.db`.
+
+Email sender:
+
+- The default sender is `kawish.iftikhar@bipl.io` on `smtp.gmail.com:587`.
+- The app password is never stored in the source. Put it in `email.json` next to `employees.db` (or next to `IT Records.exe`), or enter it in **More → Email Settings**:
+
+```json
+{"smtp_email": "kawish.iftikhar@bipl.io", "smtp_password": "<app password>"}
+```
+
+- `email.json` is git-ignored. **Email Settings → Test connection** checks the sign-in without sending anything.
 
 Password recovery command:
 

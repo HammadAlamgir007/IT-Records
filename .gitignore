@@ -22,3 +22,6 @@ dist/
 *.bak
 it_records.log*
 YOUR-DATA/
+
+# Sender app password for Send Email - local only, never committed.
+email.json
